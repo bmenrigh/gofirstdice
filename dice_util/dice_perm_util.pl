@@ -263,8 +263,9 @@ if (defined $cgi_var->param('input')) {
 	print '<p><b>Dice side counts:</b></p>', "\n";
 	print '<textarea name="input"  rows="6" cols="96">', "\n";
 	for (my $i = 0; $i < $N; $i++) {
-	    print 'Die ', ($i + 1), ': ', scalar @{$newdice[$i]}, "\n"
+	    print 'Die ', ($i + 1), ':', "\t", scalar @{$newdice[$i]}, "\n"
 	}
+	print 'Total:', "\t", (length $dicestr), "\n";
 	print '</textarea>', "\n";
 	print '<hr />', "\n";
 
