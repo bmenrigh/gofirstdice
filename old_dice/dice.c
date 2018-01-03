@@ -1,0 +1,385 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define DICE  5
+#define SIDES 30
+
+int grid[DICE][SIDES];
+int g_cache[SIDES][DICE][SIDES];
+
+int selection[DICE];
+int tallies[DICE][DICE];
+
+void distribute(int (*)[DICE][SIDES], int);
+void print_grid(int (*)[DICE][SIDES]);
+int next_perm(int (*)[DICE][SIDES], int (*)[DICE + 1], int, int);
+int is_fair(int (*)[DICE][SIDES], int);
+void print_tallies(int (*)[DICE][DICE]);
+void count_perms(int (*)[DICE][SIDES], int, int (*)[DICE],
+		 int (*)[DICE][DICE], int);
+int check_tallies(int (*)[DICE][DICE], int);
+int check_rows(int (*)[DICE][SIDES], int, int);
+int check_pair_fair(int (*)[DICE][SIDES], int, int);
+void fill_columns2(int (*)[DICE][SIDES], int);
+void fill_columns4(int (*)[DICE][SIDES], int);
+
+int main(void) {
+
+  int i, j;
+
+  for (j = 0; j < DICE; j++) {
+    for (i = 0; i < SIDES; i++) {
+      grid[j][i] = (i * DICE) + j;
+    }
+  }
+  /*print_grid(&grid); */
+
+  distribute(&grid, 0);
+
+
+
+  return 0;
+}
+
+
+void distribute(int (*g)[DICE][SIDES], int depth) {
+
+  int k;
+  int p[DICE + 1];
+
+  /*fprintf(stderr, "depth: %d\n", depth); */
+
+  /*if (depth == 2) {
+    print_grid(g);
+    }*/
+
+  if ((depth >= 0) && (depth % 2 == 0)) {
+    if (check_rows(g, depth, 2) == 0) {
+      return;
+    }
+  }
+
+  /*
+  if ((depth == 6) || (depth == 10)) {
+    if (check_rows(g, depth, 1) == 0) {
+      return;
+    }
+  }
+
+  if ((depth == 4) || (depth == 8) || (depth == 12)) {
+    if (check_rows(g, depth, 0) == 0) {
+      return;
+    }
+    }*/
+
+  /* see if we've solved it */
+  /*if (depth >= (SIDES)) {*/
+  if (depth >= (SIDES / 2)) {
+    if (check_rows(g, SIDES, 0) == 1) {
+      /*if (is_fair(g, SIDES) == 1) { */
+      /*printf("Got preliminary fair:\n");
+	print_grid(g);*/
+      
+      /* Just check the first two, first */
+      /*memset(&tallies, 0, sizeof(tallies));
+      count_perms(g, 0, &selection, &tallies, 2);
+      if (check_tallies(&tallies, 2) == 0) {
+	return;
+	}*/
+
+      /*fprintf(stderr, "Got to end\n");*/
+
+
+      if (check_pair_fair(g, 0, 1) != 1) {
+	return;
+      }
+      if (check_pair_fair(g, 0, 2) != 1) {
+	return;
+      }
+      if (check_pair_fair(g, 1, 2) != 1) {
+	return;
+      }/*
+      if (check_pair_fair(g, 2, 3) != 1) {
+	return;
+	}*/
+
+      /* check 3 when we're going for 4 or more */
+      if (DICE >= 4) {
+	memset(&tallies, 0, sizeof(tallies));
+	count_perms(g, 0, &selection, &tallies, 3);
+	if (check_tallies(&tallies, 3) != 3) {
+	  return;
+	}
+      }
+
+      /* check 4 when we're going for 5 or more */
+      if (DICE >= 5) {
+	memset(&tallies, 0, sizeof(tallies));
+	count_perms(g, 0, &selection, &tallies, 4);
+	if (check_tallies(&tallies, 4) != 4) {
+	  return;
+	}
+      }
+
+      /* Check to see if these are fair for first place */
+      memset(&tallies, 0, sizeof(tallies));
+      count_perms(g, 0, &selection, &tallies, DICE);
+      if (check_tallies(&tallies, DICE) > 0) {
+	printf("Got set that is fair for first place\n");
+	print_grid(g);
+	print_tallies(&tallies);
+	/*} */
+      }
+
+      memset(&tallies, 0, sizeof(tallies));
+      count_perms(g, 0, &selection, &tallies, DICE);
+      if (check_tallies(&tallies, DICE) == DICE) {
+	printf("Got set that is fair for all places\n");
+	print_grid(g);
+	/*print_tallies(&tallies);*/
+	/*} */
+	return;
+      }
+
+      /*fprintf(stderr, "Almost fair\n");
+	print_tallies(&tallies);*/
+    }
+    return;
+  }
+
+  /* If we've placed an even number of colums check for fairness */
+  /*if ((depth > 0) && ((depth % 2) == 0)) {
+    if (is_fair(g, depth) != 1) {
+      return;
+    }
+    }*/
+
+  /* save this grid */
+  memcpy(&(g_cache[depth]), g, sizeof(grid));
+
+  /* init permutation */
+  for (k = 0; k <= DICE; k++) {
+    p[k] = k;
+  }
+  k = 1;
+
+  /* run permutation */
+
+  /*fill_columns4(&(g_cache[depth]), depth);
+    distribute(&(g_cache[depth]), depth + 2);*/
+  fill_columns2(&(g_cache[depth]), depth);
+  distribute(&(g_cache[depth]), depth + 1);
+  if (depth > 0) {
+    while ((k = next_perm(&(g_cache[depth]), &p, k, depth)) != DICE) {
+      /*fill_columns4(&(g_cache[depth]), depth);
+	distribute(&(g_cache[depth]), depth + 2);*/
+      fill_columns2(&(g_cache[depth]), depth);
+      distribute(&(g_cache[depth]), depth + 1);
+    }
+    /*fill_columns4(&(g_cache[depth]), depth);
+      distribute(&(g_cache[depth]), depth + 2);*/
+    fill_columns2(&(g_cache[depth]), depth);
+    distribute(&(g_cache[depth]), depth + 1);
+  }
+
+
+}
+
+
+void fill_columns2(int (*g)[DICE][SIDES], int depth) {
+
+  int i;
+
+  for (i = 0; i < DICE; i++) {
+
+    /* Set the mirror column */
+    (*g)[i][SIDES - (depth + 1)] =
+      (DICE * SIDES) - ((*g)[i][depth] + 1);
+  }
+}
+
+
+void fill_columns4(int (*g)[DICE][SIDES], int depth) {
+
+  int i;
+
+  for (i = 0; i < DICE; i++) {
+
+    /* Set the mirror column */
+    (*g)[i][SIDES - (depth + 1)] =
+      (DICE * SIDES) - ((*g)[i][depth] + 1);
+ 
+    /* Set the next column too */
+    (*g)[i][depth + 1] = ((DICE * (depth + 2)) - 1) -
+      ((*g)[i][depth] % DICE);
+
+    if ((depth + 1) != (SIDES / 2)) {
+      /* Set the next's mirror column too */
+      (*g)[i][SIDES - (depth + 2)] =
+	(DICE * SIDES) - ((*g)[i][depth + 1] + 1);
+    }
+  }
+
+}
+
+
+void count_perms(int (*g)[DICE][SIDES], int depth,
+		 int (*s)[DICE], int (*t)[DICE][DICE], int d) {
+
+  int i, i2, count;
+
+  if (depth == d) {
+    for (i = 0; i < d; i++) {
+      count = 0;
+
+      for (i2 = 0; i2 < d; i2++) {
+	if ((*s)[i] < (*s)[i2]) {
+	  count++;
+	}
+      }
+      (*t)[i][count] += 1;
+    }
+
+    return;
+  }
+
+  for (i = 0; i < SIDES; i++) {
+    (*s)[depth] = (*g)[depth][i];
+    count_perms(g, depth + 1, s, t, d);
+  }
+
+}
+
+
+int is_fair(int (*g)[DICE][SIDES], int d) {
+
+  int i, j;
+
+  /* add cells the N and N + 1 (where N is even) colums.  to be fair
+   * they must be equal to (DICE - 1) when modded by DICE
+   */
+  for (i = 0; (((i + 1) < d) && ((i + 1) < SIDES)); i += 2) {
+    for (j = 0; j < DICE; j++) {
+      if ((((*g)[j][i] + (*g)[j][i + 1]) % DICE) != DICE - 1) {
+	return 0;
+      }
+    }
+  }
+
+  return 1;
+}
+
+
+int check_pair_fair(int (*g)[DICE][SIDES], int d1, int d2) {
+
+  int i, c;
+
+  c = 0;
+  for (i = 0; i < SIDES; i++) {
+    if ((*g)[d1][i] > (*g)[d2][i]) {
+      c += 1;
+    }
+  }
+
+  if (c == (SIDES / 2)) {
+    return 1;
+  }
+
+  return 0;
+}
+
+
+void print_grid(int (*g)[DICE][SIDES]) {
+
+  int i, j;
+
+  printf("----------------------\n");
+
+  for (j = 0; j < DICE; j++) {
+    for (i = 0; i < SIDES; i++) {
+      printf("%-2d ", (*g)[j][i]);
+    }
+    printf("\n");
+  }
+
+}
+
+
+int check_tallies(int (*t)[DICE][DICE], int d) {
+
+  int i, j, p;
+
+  p = 0;
+  for (i = 0; i < d; i++) {
+    for (j = 0; j < d; j++) {
+
+      if ((*t)[j][i] != (*t)[0][0]) {
+	return p;
+      }
+    }
+    p += 1;
+  }
+ 
+  return p;
+}
+
+
+void print_tallies(int (*t)[DICE][DICE]) {
+
+  int i, j;
+
+  printf("----------------------\n");
+
+  for (j = 0; j < DICE; j++) {
+    for (i = 0; i < DICE; i++) {
+      printf("%-5d ", (*t)[j][i]);
+    }
+    printf("\n");
+  }
+
+}
+
+
+int check_rows(int (*g)[DICE][SIDES], int d, int v) {
+
+  int i, j, s;
+
+  for (j = 0; j < DICE; j++) {
+    s = 0;
+    for (i = 0; ((i < d) && (i < SIDES)); i++) {
+      s += (*g)[j][i];
+    }
+    if ((s < (((d * ((d * DICE) - 1)) / 2) - v)) ||
+	(s > (((d * ((d * DICE) - 1)) / 2) + v))) {
+      return 0;
+    }
+  }
+
+  return 1;
+}
+
+
+
+/* http://permuteweb.tchs.info/
+ * Copyright 1991-2008, Phillip Paul Fuchs
+ */
+int next_perm(int (*g)[DICE][SIDES], int (*p)[DICE + 1],
+		      int k, int c) {
+  (*p)[k]--;
+
+  int j = k % 2 * (*p)[k];
+
+  int tmp = (*g)[j][c];
+
+  (*g)[j][c] = (*g)[k][c];
+
+  (*g)[k][c] = tmp;
+
+  for (k = 1; (*p)[k] == 0; k++) {
+    (*p)[k] = k;
+  }
+
+  return k;
+}
+
