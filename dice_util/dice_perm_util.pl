@@ -75,14 +75,14 @@ sub parse_dice {
     if (scalar @cleaner == 0) {
 	return 1;
     }
-  
+
     if (scalar @cleaner == 1) {
 	# okay we probaby got aaaabbbcdeaaa or maybe 0 1 0 2 2 2 3
 	# or some other similar shit like 0123, 4 5 9
 
 	my %syms;
 	my %order;
-	
+
 	while ($cleaner[0] =~ m/([a-z0-9])/ig) {
 	    my $let = $1;
 
@@ -93,7 +93,7 @@ sub parse_dice {
 	    $order{$let} = chr(ord('a') + $c);
 	    $c++;
 	}
-	
+
 	my $dstr = '';
 	while ($cleaner[0] =~ m/([a-z0-9])/ig) {
 	    my $let = $1;
@@ -121,7 +121,7 @@ sub parse_dice {
 	for (my $i = 0; $i < scalar @cleaner; $i++) {
 	    while ($cleaner[$i] =~ m/(\d+)/g) {
 		my $num = $1;
-		
+
 		if ($num > 1000000) {
 		    return 1;
 		}
@@ -155,7 +155,7 @@ sub parse_dice {
 	    }
 	}
 
-	
+
 	if (scalar @cleaner > 15) {
 	    return 1;
 	}
@@ -228,6 +228,7 @@ if (defined $cgi_var->param('input')) {
 	print '<p><b>Unable to interpret input!</b></p>', "\n";
     }
     else {
+	print '<p><b><h2>Dice Input Details:</h2></b></p>', "\n";
 	print '<p><b>Interpreted input in string form:</b></p>', "\n";
 	print '<p>', $dicestr, '</p>', "\n";
 
@@ -258,13 +259,21 @@ if (defined $cgi_var->param('input')) {
 	    print "\n";
 	}
 	print '</textarea>', "\n";
+
+	print '<p><b>Dice side counts:</b></p>', "\n";
+	print '<textarea name="input"  rows="6" cols="96">', "\n";
+	for (my $i = 0; $i < $N; $i++) {
+	    print 'Die ', ($i + 1), ': ', scalar @{$newdice[$i]}, "\n"
+	}
+	print '</textarea>', "\n";
 	print '<hr />', "\n";
+
 
 	if ($N <= 10) {
 	    my %perms;
 	    #print '<p>Debug: dicestr: ', $dicestr, '</p>', "\n";
 	    find_perms($dicestr, \%perms);
-	    
+
 	    print '<p><b><h2>Dice Permutation counts:</h2></b></p>', "\n";
 	    for (my $l = 2; $l <= $N; $l++) {
 		my $pgoal = npr($N, $l);
@@ -283,7 +292,7 @@ if (defined $cgi_var->param('input')) {
 		    ' permutations unreachable</font></p>', "\n";
 		}
 	    }
-	    
+
 	    my @places;
 	    my %place_subsets;
 	    for (my $i = 2; $i <= $N; $i++) {
@@ -307,10 +316,10 @@ if (defined $cgi_var->param('input')) {
 		    }
 
 		    for (my $i = 0; $i < $l; $i++) {
-			
+
 			my $let = substr($pstr, $i, 1);
 			my $dice = ord($let) - ord('a');
-			
+
 			$places[$l - 2][$dice][($l - 1) - $i] += $perms{$pstr};
 
 			$place_subsets{$subpstr}{$let}[($l - 1) - $i]
@@ -336,7 +345,7 @@ if (defined $cgi_var->param('input')) {
 		    }
 		    print "\n";
 		}
-		print '</textarea>', "\n";	
+		print '</textarea>', "\n";
 	    }
 
 
@@ -350,7 +359,7 @@ if (defined $cgi_var->param('input')) {
 		foreach my $subpstr (sort keys %place_subsets) {
 		    next unless (length $subpstr == $i);
 		    my @sublist = sort split(//, $subpstr);
-		    
+
 		    print 'Subset ', $subpstr, ' place stats...', "\n";
 		    print 'Place: ';
 		    for (my $j = 0; $j < $i; $j++) {
@@ -375,7 +384,7 @@ if (defined $cgi_var->param('input')) {
 	}
 
     }
-    
+
 }
 
 print '<hr />', "\n";
