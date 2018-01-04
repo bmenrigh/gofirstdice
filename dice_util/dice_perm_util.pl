@@ -389,5 +389,5 @@ if (defined $cgi_var->param('input')) {
 }
 
 print '<hr />', "\n";
-print '<p><sup>*</sup>Only sane input formats are supported.</p>', "\n";
+print '<p><sup>*</sup>Only sane input formats are supported.</p><p>Example input: abcdeecdabdbaececdabbecdadbcaeacbdeecdabbeacdeabdcdacebbacdedcaebacbdeabcdeedcbaedbcabeacdedcabbecadcdbaedcaebbadceedbcaeacbdadcebbadceceabdbadceedcba</p>', "\n";
 print $cgi_var->end_html();
