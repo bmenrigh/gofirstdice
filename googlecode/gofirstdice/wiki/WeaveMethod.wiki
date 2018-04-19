@@ -1,0 +1,43 @@
+#summary The weave method searches for dice sets by building them out of smaller dice sets adding one die at a time.
+
+= Introduction =
+
+The basic idea of the weave method is that you can't have a set of 4 fair dice, unless every 3 dice subset is also fair.  You start with a n=0 dice set and doing a depth first search, you add one die at a time.
+
+
+= Psuedo Code =
+
+{{{
+depthS(string str, int n, int s, int lastinsert)
+    update_fairness_calc(lastinsert)
+    if(!fair())
+        return
+
+    if(s == MAX_S)
+        depthN(str, n)
+
+    for(i = lastinsert; i <= MAX_S * (n-1); ++i)
+        depthS(str.insert('a' + n - 1, i), n, s + 1, i)
+
+depthN(string str, int n)
+    if(n == MAX_N)
+        print("solution = " + n)
+        return
+    calculate_worth_of_all_insertion_points(str)
+    depth(str, n + 1, 0, 0)
+  
+main()
+    depthN("", 0)
+}}}
+
+= Future Work =
+
+Here's an outline of the basic idea of the simple version.  
+ # First build a list of all n=2 solutions.  
+ # When going from a n=2 set to a n=3 set, ALL n=2 subsets of the n=3 set must be part of the list generated in step 1.  Keep a list of all n=2 subsets of the n=3 solutions.
+ # Again, when going from a n=3 set to a n=4 set, all n=2 subsets of the n=4 set must be part of the list generated step 2.
+
+But we can do even better.  There are 3 different n=2 subsets in all n=3 sets, ba, ca, and cb.  We can keep separate lists for all n=2 subsets.  When building n=4 sets, we use their n=3 subsets and again filter based on the more specific 3 different n=2 lists.  For example, the db relationship in dcba is part of 2 n=3 subsets, dcb and dba.  In those subsets, db is equivalent to ca and cb in cba.  Full relationship chart listed below.
+http://landonkryger.com/rubik/dice/flowchart.png
+
+Lists of n=2 subset counts are available on the wiki page [Results].

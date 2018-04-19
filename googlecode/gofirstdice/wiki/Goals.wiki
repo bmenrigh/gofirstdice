@@ -1,0 +1,7 @@
+#summary What we hope to accomplish
+
+= Goals =
+
+The "holy grail" of this project (at least for Eric Harshbarger) would be to find a set of 6 permutation-fair dice, all of equal size, which is manufacturable in a pleasing geometric, fair shape. This means 6d30, 6d60, or 6d120. Such a set would represent a wonderful intersection of mathematical and computational research, geometric possibilities, and fun, board game novelty items.
+
+Possibly only lesser goals are attainable (5d30, lesser fairness, etc); but if the ultimate were achieved, then serious consideration would be given to actually investing funds to get custom molds made and 6d30 sets manufactured on a commercial level.

@@ -1,0 +1,77 @@
+K 25
+svn:wc:ra_dav:version-url
+V 39
+/svn/!svn/ver/72/trunk/brandon/dicecode
+END
+Makefile
+K 25
+svn:wc:ra_dav:version-url
+V 47
+/svn/!svn/ver/4/trunk/brandon/dicecode/Makefile
+END
+dice_perm_util.pl
+K 25
+svn:wc:ra_dav:version-url
+V 57
+/svn/!svn/ver/70/trunk/brandon/dicecode/dice_perm_util.pl
+END
+rc4_16.c
+K 25
+svn:wc:ra_dav:version-url
+V 47
+/svn/!svn/ver/4/trunk/brandon/dicecode/rc4_16.c
+END
+dicemdeep.c
+K 25
+svn:wc:ra_dav:version-url
+V 51
+/svn/!svn/ver/72/trunk/brandon/dicecode/dicemdeep.c
+END
+dicesmarter.c
+K 25
+svn:wc:ra_dav:version-url
+V 52
+/svn/!svn/ver/4/trunk/brandon/dicecode/dicesmarter.c
+END
+diceclimber.c
+K 25
+svn:wc:ra_dav:version-url
+V 52
+/svn/!svn/ver/4/trunk/brandon/dicecode/diceclimber.c
+END
+dicedeep.c
+K 25
+svn:wc:ra_dav:version-url
+V 49
+/svn/!svn/ver/4/trunk/brandon/dicecode/dicedeep.c
+END
+pavl.c
+K 25
+svn:wc:ra_dav:version-url
+V 45
+/svn/!svn/ver/4/trunk/brandon/dicecode/pavl.c
+END
+dicepdeep.c
+K 25
+svn:wc:ra_dav:version-url
+V 50
+/svn/!svn/ver/4/trunk/brandon/dicecode/dicepdeep.c
+END
+rc4_16.h
+K 25
+svn:wc:ra_dav:version-url
+V 47
+/svn/!svn/ver/4/trunk/brandon/dicecode/rc4_16.h
+END
+dice.c
+K 25
+svn:wc:ra_dav:version-url
+V 45
+/svn/!svn/ver/4/trunk/brandon/dicecode/dice.c
+END
+pavl.h
+K 25
+svn:wc:ra_dav:version-url
+V 45
+/svn/!svn/ver/4/trunk/brandon/dicecode/pavl.h
+END

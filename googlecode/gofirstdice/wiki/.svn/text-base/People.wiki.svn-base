@@ -1,0 +1,17 @@
+#summary People involved with the Go First Dice project.
+
+= People =
+
+These are people who have access to this project.
+
+==Eric Harshbarger==
+Game, puzzle, and dice designer. Was the first to seriously consider the "Go First Dice" problem after it was suggested to him by game designer James Ernest. Eric has Bachelor's and Master's degrees in mathematics from Auburn University. He worked for Sun Microsystems as a Java programer in the late 90s. He programs now only for personal pursuits. His personal website is at http://www.ericharshbarger.org .
+
+==Robert Ford==
+Ph.D. in mathematics from Auburn University. Assistant Professor of Mathematics at Dalton State College (Georgia).
+
+==Brandon Enright==
+Security engineer by day, puzzle nerd and recreational hacker by night.  Brandon is interested in the "Go First Dice" problem because it is deceptively hard and leaves lots of room for clever algorithms and creative coding.  He is most interested in finding a set of 5 30-sided dice that are permutation-fair.
+
+==Landon Kryger==
+B.S. in Computer Science.  I enjoy algorithm optimization and finding new pruning techniques for problems.

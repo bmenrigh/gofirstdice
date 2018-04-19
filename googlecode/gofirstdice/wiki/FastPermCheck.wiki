@@ -1,0 +1,99 @@
+#summary Describes an algorithm to quickly test if a set of dice is fair.
+
+= Introduction =
+
+This algorithm was created by Landon Kryger to solve the problem of testing if a set of dice is fair.  If you have n players and s sides, the standard approach would require you to test every roll and would run in O(s^n).  This algorithm runs in approximately O(s*n*n!).  For small s,n, it's not a very noticeable difference, but for large values like n=5;s=30 the benefit is huge.
+
+This algorithm also works with dice with different number of sides.
+
+
+= Python =
+
+{{{
+1  s = "abcddbaccbadcabddacbdbcadcbadcabbcaddacbbacdabcdacbdbcaddbacdabccabddcba"
+2  count = {"" : 1}
+3  for c in s:
+4      for k in count.keys():
+5          if k.count(c)==0:
+6              k2 = k + c
+7              count[k2] = count.get(k2,0) + count[k]
+}}}
+
+ # s is just the input dice set
+ # count will contain how many ways each substring can occur.  We initialize it to say that from the get-go, there is only one way to have the empty string.
+ # We step through every number in the die step. Each step will depend on the previous step.
+ # We need to look at all substrings.  The real magic happens on line 7
+ # We don't need to look at strings like 'aba'.  A die can only produce a number once per roll.
+ # k2 is the new string concatenated with the current die/number we're processing.
+ # The simplest way to explain this is with an example.  Let's say the current letter is a c.  The number of ways to make 'abc' now will be equal to how many you could do before plus how many ways you could do 'ab' because all those 'ab's now can have a 'c' added to them.
+{{{
+count['abc'] += count['ab']
+}}}
+
+= Optimizations =
+
+String concatenation and variable sized dictionaries are very slow.  First enumerate all possible strings and number them.
+|| id || string ||
+|| 0 || "" ||
+|| 1 || "a" ||
+|| 2 || "b" ||
+|| 3 || "c" ||
+|| 4 || "d" ||
+|| 5 || "ab" ||
+|| 6 || "ac" ||
+|| 7 || "ad" ||
+|| 8 || "ba" ||
+|| ... || ... ||
+|| 64 || "dcba" ||
+|| 65 || dummy string ||
+
+Next we need another lookup table for the virtual string concatenations.  A 65 indicates that that concatenation isn't legal because it would contain 2 duplicate characters.  We use a dummy string index because it's faster to do an addition in the implementation futher below, than to check for -1 and branch.
+|| || 0 "" || 1 "a" || 2 "b" || 3 "c" || 4 "d" || 5 "ab" || ... || 64 "dcba" ||
+|| 0 - a || 1 "a" || 65 || 8 "ba" || 11 "ca" || 14 "da" || -1 || ... || 65 ||
+|| 1 - b || 2 "b" || 4 "ab" || 65 || 12 "cb" || 15 "db" || -1 || ... || 65 ||
+|| 2 - c || 3 "c" || 5 "ac" || 9 "bc" || 65 || 16 "dc" || 17 "abc" || ... || 65 ||
+|| 3 - d || 4 "d" || 6 "ad" || 10 "bd" || 13 "cd" || 65 || 18 "abd" || ... || 65 ||
+
+Another alternative table I realize I should implement can avoid the 65 reference all together and be possibly faster.  It will be a 3 dimensional table.  The first dimension is for what the current character is that you'll be adding on.  The 2nd dimension is just an index for a list of strings it can add to.  The last dimension only has 2 elements, a start string index and end string index.  Here's what table2[0 ] would approximately look like.
+
+|| index || start string || end string ||
+|| 0 || 0 "" || 1 "a" ||
+|| 1 || 2 "b" || 8 "ba" ||
+|| 2 || 3 "c" || 11 "ca" ||
+|| 3 || 4 "d" || 14 "da" ||
+|| ... || ... || ... ||
+|| 15 || 40 "dcb" || 1 "dcba" ||
+
+And how we would use them in code
+{{{
+int s[48] = {0,1,2,3,4,4,2,1,3,3, ... }
+int count[64 or 65 depending on if your using table 1 or 2];
+for(int i=0; i<s.length; ++i){
+    int c = s[i];
+    // Using table 1
+    for(int j=0; j<65; ++j){
+        count[table1[j][c]] += count[j];
+    }
+    // Using table 2
+    for(int j=0; j<15; ++j){
+        count[table2[c][j][1]] += count[table2[c][j][0]];
+    }
+}
+}}}
+
+
+If you're using this for the WeaveMethod, I'd recommend building separate tables for each level of n which would just add an extra dimension to your string concatenation tables.
+
+= Using for the WeaveMethod  =
+
+{{{
+abcddbaccbadcabddacb dbcadcbadcabbcaddacbbacdabcdacbdbcaddbacdabccabddcba
+                    ^
+                    e
+}}}
+In the WeaveMethod, you need to make a table for how much a specific insertion contributes to each of the n! without running the algorithm on every new string.  The first modification we need to do is keep a copy of count for every substring.  Next, we need to duplicate our algorithm.  The original function processes it from left to right.  We need another version that processes it from right to left.  If we're looking for the string "abecd", the code will approximately look like this.
+{{{
+count['abecd'] = countBefore[20]['ab'] * countAfter[48-20]['cd']
+}}}
+Remember to create cached tables for these string concatenation relationships too.
+

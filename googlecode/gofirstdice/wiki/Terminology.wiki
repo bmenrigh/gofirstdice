@@ -1,0 +1,44 @@
+= Terminology =
+
+== Basic Dice Notation/Terms/Vocabulary ==
+
+ * *Plurality*
+  In case it is not clear: "dice" is the plural form of the noun. The singular for is "die". The form "dices" is not a word.
+
+ * *Size*
+  The "size" of a die is usually referring to the number of faces on a die, not the physical dimensions of a die.
+
+ * *MdN*
+  This is notation to represent one or more dice of a particular size. For example. "5d30" refers to five dice of size with thirty sides each. If only a single die is being referenced, the "1" is usually omitted (e.g. "d20" instead of "1d20").
+
+== Desired Statistical Properties ==
+
+ * *Go First Fairness*
+  This is the weakest of all desired properties.  A set of dice that are "Go First Fair" can be used to pick which player goes first.  All of the dies have an equal chance of going first but 2nd and other places may not be fair.
+
+ * *Place Fairness*
+  Place fairness is an extension of "Go First Fairness" to all places.  Each die is equally likely to roll 1st, 2nd, 3rd, etc.  Place fair dice do not insure that every ordering is equally likely, just that every place is equally likely.
+
+ * *Permutation Fair*
+  Permutation fairness is the strongest fairness property a set of dice can have.  Dice that are permutation fair are automatically go-first and place-fair with the added benefit that the dice can be used to fairly determine the order of the players because all orderings are equally likely.  Permutation fairness implies that any and all subsets of the dice are also permutation fair.  For example, with a set of 4 permutation-fair dice, any 3 dice can be chosen from the set and those dice will also be permutation-fair.
+
+== Dice Configuration Subgroups ==
+
+ * *Opposite-face symmetry / Mirror symmetry*
+  Mirror symmetry means that the die with the smallest number also has the biggest number.  The second smallest number comes with the second largest number, etc.  By placing the these pairs of numbers on opposite faces, the sum of opposite faces always equal the same number.
+  This symmetry dramatically reduces the number of possible configurations and is very useful for computer search because it reduces the search space and provides some more pruning options.
+
+ * *Column Grouping* / *Even Distribution*
+  Given a set of MdN dice, they exhibit "even distribution" if the members of each group of M numbers are placed on separate dice. For example, in a 5-dice set, the first 5 numbers {0, 1, 2, 3, 4} would each be on a different die, as would each of the next 5 numbers {5, 6, 7, 8, 9}, and so on.
+
+ * *Column Pairing* / *Type-2 Symmetry*
+  The 4d12 set that is sold also exhibits the following type of number grouping (which can be extended to 5+ dice): for each odd column, N, a die's number determines the number in column N+1 because the sum of these pairs across all dice are all the same. Viewing our retail 4d12 dice:
+
+{{{
+D1: 1,8,11,14,19,22,27,30,35,38,41,48
+D2: 2,7,10,15,18,23,26,31,34,39,42,47
+D3: 3,6,12,13,17,24,25,32,36,37,43,46
+D4: 4,5,9,16,20,21,28,29,33,40,44,45
+}}}
+
+    we see that on each die the first two numbers each add up to 9. The next two numbers all add up to 25, and so on.

@@ -1,0 +1,17 @@
+#summary Miscellaneous pictures of Go-First related things.
+
+The original 4d12 Go First Dice (sold by Eric):
+
+http://www.ericharshbarger.org/dice/4d12_gofirst_v2s.jpg
+
+----
+
+A sphere partitioned into 120 triangular sections. 3D-printed and assembled by Eric. A similar shape could be used as a 120-sided die, if needed. Join pairs of adjacent triangles to visualize a 60-sided (three ways this can be done).
+
+https://sphotos-b.xx.fbcdn.net/hphotos-snc6/229832_10151282359002578_1777771069_n.jpg
+
+----
+
+A 3D printed prototype set of the best 5-player, permutation set found (d20-d24-d36-d48-d72).
+
+http://www.ericharshbarger.org/dice/d20-d24-d36-d48-d72.jpg
