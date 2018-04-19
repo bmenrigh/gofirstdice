@@ -11,7 +11,7 @@ import (
 
 const (
 	DICE = uint8(4)
-	SIDES = uint8(12)
+	SIDES = uint8(18)
 )
 
 var (
@@ -142,43 +142,60 @@ func ispermfair(perms map[string]int) bool {
 
 func isallsubsetplacefair(perms map[string]int) bool {
 
-	subsets := make(map[string]map[string][]uint64)
-	var subsetgoals [DICE - 1]uint64
+	// A subset is an ordered set of letters like acd
+	// The second map is an individual letter like c
+	// The slice tracks the number of times the letter shows
+	// up in a given place
+	subsets := make(map[string]map[string][]uint64) // [subset][letter][place]
 
+	// Computer the goal sum for each place for each letter in each subset
+	var subsetgoals [DICE - 1]uint64
 	for i := uint8(0); i < DICE - 1; i++ {
 		subsetgoals[i] = intpow(SIDES, i + 2) / (uint64(i) + 2)
 	}
 
+	// For each full permutation like abc, bac, acb, etc.
 	for p := range perms {
 		l := len(p)
 
+		// Skip the empty perm and the singe-die perms
 		if l > 1 {
 
+			// Get a list of the letters and sort them
+			// to get which subset this is
 			letlist := strings.Split(p, ``)
 			sort.Strings(letlist)
 			subset := strings.Join(letlist, ``)
 
+			// If we haven't seen this subset yet then create
+			// the additional letter map and place slice
 			if _, ok := subsets[subset]; ok == false {
 				subsets[subset] = make(map[string][]uint64)
-
 
 				for _, a := range letlist {
 					subsets[subset][a] = make([]uint64, l)
 				}
 			}
 
+			// Now for each letter in this permutation, record
+			// how many times it shows up in the Nth position
+			// in this subset
 			for i := 0; i < l; i++ {
-				a := p[i:i + 1]
+				a := p[i:i + 1] // Grap out just the single letter at this index
 
 				subsets[subset][a][i] += uint64(perms[p])
 			}
 		}
 	}
 
+	// Now for each subset
 	for subset := range subsets {
+		// And each letter within the subset
 		for a := range subsets[subset] {
 
 			l := len(subset)
+			// Make sure each Nth place this letter shows up
+			// is equal to the goal we expect for a fully place fair subset
 			for _, s := range subsets[subset][a] {
 				if s != subsetgoals[l - 2] {
 
