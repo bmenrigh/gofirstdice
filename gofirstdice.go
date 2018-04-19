@@ -11,7 +11,7 @@ import (
 
 const (
 	DICE = uint8(4)
-	SIDES = uint8(18)
+	SIDES = uint8(12)
 )
 
 var (
@@ -212,6 +212,23 @@ func isallsubsetplacefair(perms map[string]int) bool {
 }
 
 
+func checkpairsfair(dset *diceset, d1 uint8, d2 uint8) bool {
+
+	// This function checks to see if d1 and d2 are pairwise-fair
+	c := uint8(0)
+	for s := uint8(0); s < SIDES; s++ {
+		if (*dset)[d1][s] > (*dset)[d2][s] {
+			c++
+		}
+	}
+
+	if c == SIDES / 2 {
+		return true
+	}
+
+	return false
+}
+
 
 func printperms(perms map[string]int) {
 
@@ -379,98 +396,141 @@ func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side uint8,
 	tally_table *placetally, min_tally *tallytable, max_tally *tallytable) {
 
+	// Make local copies of the min/max tally tables
+	var loc_min_tally, loc_max_tally tallytable
+	for d := uint8(0); d < DICE; d++ {
+		for s := uint8(0); s < SIDES; s++ {
+			for pl := uint8(0); pl < DICE; pl++ {
+				loc_min_tally[d][s][pl] = (*min_tally)[d][s][pl]
+				loc_max_tally[d][s][pl] = (*max_tally)[d][s][pl]
+			}
+		}
+	}
 
-	// We've gotten to the end of a dice, move on to the next or check results
-	if side >= SIDES {
+	// Pre-allocate a runningtally for each recursion call so we
+	// don't have to constantly make a new one and have the GC
+	// constantly collecting them
+	var curtallycache[DICE][SIDES + 1]runningtally
 
-		// Check for place fairness
-		for pl := uint8(0); pl < DICE; pl ++ {
-			if (*curtally)[pl] != TALLYGOAL {
+	// Copy the passed curtally into the cache
+	for pl := uint8(0); pl < DICE; pl++ {
+		curtallycache[row][side][pl] = (*curtally)[pl]
+	}
+
+	// Pre-allocate a dset for each recursion call too
+	var dsetcache[DICE][SIDES + 1]diceset
+
+	// Copy the passed dset into the cache
+	for d := uint8(0); d < DICE; d++ {
+		for s := uint8(0); s < SIDES; s++ {
+			dsetcache[row][side][d][s] = (*dset)[d][s]
+		}
+	}
+
+	var search func(*diceset, *runningtally, uint8, uint8)
+	search = func(dset *diceset, curtally *runningtally, row uint8, side uint8) {
+
+		// We've gotten to the end of a dice, move on to the next or check results
+		if side >= SIDES {
+
+			// Check for place fairness
+			for pl := uint8(0); pl < DICE; pl ++ {
+				if (*curtally)[pl] != TALLYGOAL {
+					return
+				}
+			}
+
+			// Check pairwise fairness up to this point
+			for d1 := uint8(0); d1 < row; d1++ {
+				if checkpairsfair(dset, d1, row) == false {
+					return
+				}
+			}
+
+			// If there are any dice left, move on to them
+			if row < (DICE - 1) {
+
+				// We're starting a new row, zero out the tally
+				for pl := uint8(0); pl < DICE; pl++ {
+					curtallycache[row][side][pl] = 0
+				}
+
+				search(dset, &(curtallycache[row][side]), row + 1, 0)
+
+				return;
+			} else {
+				// This means we have now filled out all the dice
+
+				dstrlist := setstring(*dset)
+				dstr := strings.Join(dstrlist, ``)
+				//fmt.Printf("Got placefair set: %s\n", dstr)
+				placefaircount++
+
+				perms := findperms(dstrlist)
+
+				if ispermfair(perms) {
+				 	permfaircount++
+				 	fmt.Printf("Got permfair set: %s\n", dstr)
+				} else if isallsubsetplacefair(perms) {
+				 	allsubsetplacefaircount++
+				 	fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
+				}
+
+
 				return
 			}
 		}
 
-		// If there are any dice left, move on to them
-		if row < (DICE - 1) {
-			var zerotally runningtally
+		// Each time we start on a new row build the tally table min/max using the previous rows
+		if side == 0 && row != DICE {
+			find_tally_left(dset, row, tally_table, &loc_min_tally, &loc_max_tally)
+		}
 
-			for pl := uint8(0); pl < DICE; pl++ {
-				zerotally[pl] = 0
+		// Try to prune based on the runny tally and the min/max
+		for pl := uint8(0); pl < DICE; pl++ {
+			// If the current running tally plus the max doesn't reach our goal
+			if (*curtally)[pl] + loc_max_tally[row][side][pl] < TALLYGOAL {
+				return
 			}
 
-			fill_table_by_row(dset, &zerotally, row + 1, 0, tally_table, min_tally, max_tally)
-
-			return;
-		} else {
-			// This means we have now filled out all the dice
-
-			dstr := setstring(*dset)
-			//fmt.Printf("Got placefair set: %s\n", strings.Join(dstr, ``))
-			placefaircount++
-
-			perms := findperms(dstr)
-
-			if ispermfair(perms) {
-				permfaircount++
-				fmt.Printf("Got permfair set: %s\n", strings.Join(dstr, ``))
-			} else if isallsubsetplacefair(perms) {
-				allsubsetplacefaircount++
-				fmt.Printf("Got allsubsetplacefair set: %s\n", strings.Join(dstr, ``))
-			}
-
-
-			return
-		}
-	}
-
-	// Each time we start on a new row build the tally table min/max using the previous rows
-	if side == 0 && row != DICE {
-		find_tally_left(dset, row, tally_table, min_tally, max_tally)
-	}
-
-	// Try to prune based on the runny tally and the min/max
-	for pl := uint8(0); pl < DICE; pl++ {
-		// If the current running tally plus the max doesn't reach our goal
-		if (*curtally)[pl] + max_tally[row][side][pl] < TALLYGOAL {
-			return
-		}
-
-		// If the current running tally plus the min goes over our goal
-		if (*curtally)[pl] + min_tally[row][side][pl] > TALLYGOAL {
-			return
-		}
-	}
-
-	// At this point we are still in the recursion and need to fill out
-	// more columns for this row
-
-	for d := row; d < DICE; d++ {
-
-		// To hold the new diceset each time we change it
-		// Copy current dice set to new one
-		var newd diceset
-		for nd := uint8(0); nd < DICE; nd++ {
-			for ns := uint8(0); ns < SIDES; ns++ {
-				newd[nd][ns] = (*dset)[nd][ns]
+			// If the current running tally plus the min goes over our goal
+			if (*curtally)[pl] + loc_min_tally[row][side][pl] > TALLYGOAL {
+				return
 			}
 		}
 
-		// Swap out the cell in this row with one below
-		newd[row][side] = (*dset)[d][side]
-		newd[d][side] = (*dset)[row][side]
+		// At this point we are still in the recursion and need to fill out
+		// more columns for this row
 
-		// Duplicate the running tally table to local copy
-		var newtally runningtally
-		for pl:= uint8(0); pl < DICE; pl++ {
-			// Now that we've chosen a value, add it to our running tallies
-			newtally[pl] = (*curtally)[pl] + tally_table[newd[row][side]][pl];
-		}
+		for d := row; d < DICE; d++ {
 
-		fill_table_by_row(&newd, &newtally, row, side + 1, tally_table, min_tally, max_tally)
+			// To hold the new diceset each time we change it
+			// Copy current dice set to new one
+			for nd := uint8(0); nd < DICE; nd++ {
+				for ns := uint8(0); ns < SIDES; ns++ {
+					dsetcache[row][side][nd][ns] = (*dset)[nd][ns]
+				}
+			}
 
-		// If this is the first column we don't permute it
-		if side == 0 {
-			break
-		}
-	} // End swapping in of lower cells in this column
+			// Swap out the cell in this row with one below
+			dsetcache[row][side][row][side] = (*dset)[d][side]
+			dsetcache[row][side][d][side] = (*dset)[row][side]
+
+			// Duplicate the running tally table to the cache
+			for pl:= uint8(0); pl < DICE; pl++ {
+				// Now that we've chosen a value, add it to our running tallies
+				curtallycache[row][side][pl] = (*curtally)[pl] + (*tally_table)[dsetcache[row][side][row][side]][pl];
+			}
+
+			search(&(dsetcache[row][side]), &(curtallycache[row][side]), row, side + 1)
+
+			// If this is the first column we don't permute it
+			if side == 0 {
+				break
+			}
+		} // End swapping in of lower cells in this column
+	} // End search() func
+
+	// Now call into our search function with the arguments we got
+	search(&(dsetcache[row][side]), &(curtallycache[row][side]), row, side)
 }
