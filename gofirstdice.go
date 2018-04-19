@@ -10,13 +10,16 @@ import (
 )
 
 const (
-	DICE = uint8(5)
-	SIDES = uint8(30)
+	DICE = uint8(4)
+	SIDES = uint8(12)
 )
 
 var (
 	PERMGOAL uint64
 	TALLYGOAL uint64
+	permfaircount int
+	placefaircount int
+	allsubsetplacefaircount int
 )
 
 var (
@@ -25,7 +28,8 @@ var (
 
 type diceset [DICE][SIDES]uint8
 type placetally [DICE * SIDES][DICE]uint64 // [value] then [place]
-type tallyleft [DICE][SIDES][DICE]uint64   // [row] then [column] then [place]
+type tallytable [DICE][SIDES][DICE]uint64   // [row] then [column] then [place]
+type runningtally [DICE]uint64   // [place]
 
 
 // Sorting of permutations
@@ -39,11 +43,9 @@ func main() {
 
 	PERMGOAL = intpow(SIDES, DICE) / factorial(DICE)
 	TALLYGOAL = intpow(SIDES, DICE) / uint64(DICE)
-
-	tally_table := build_tally_table()
-	var min_tally, max_tally tallyleft
-
-	fmt.Printf("tally 0 place 0: %d\n", tally_table[0][0])
+	permfaircount = 0
+	placefaircount = 0
+	allsubsetplacefaircount = 0
 
 	var dset diceset
 
@@ -53,13 +55,29 @@ func main() {
 		}
 	}
 
+	tally_table := build_tally_table()
+	var min_tally, max_tally tallytable
+
 	find_tally_left(&dset, 0, &tally_table, &min_tally, &max_tally)
 
-	fmt.Printf("Got str: %s\n", strings.Join(setstring(dset), ``))
+	var zerotally runningtally
+
+	for pl := uint8(0); pl < DICE; pl++ {
+		zerotally[pl] = 0
+	}
+
+	fill_table_by_row(&dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally)
+
+	//fmt.Printf("Got str: %s\n", strings.Join(setstring(dset), ``))
 
 	//printperms(findperms(strings.Split("abcdeecdabdbaececdabbecdadbcaeacbdeecdabbeacdeabdcdacebbacdedcaebacbdeabcdeedcbaedbcabeacdedcabbecadcdbaedcaebbadceedbcaeacbdadcebbadceceabdbadceedcba", ``)))
 
+	//isallsubsetplacefair(findperms(strings.Split("abcddcbadbcaacbdcbdaadbccbdaadbcdbcaacbdabdccdba", ``)))
+	//isallsubsetplacefair(findperms(strings.Split("abcddcbadbcacabdabcddcbaadcbbcdabdacacdbadbccbda", ``)))
+
 	//fmt.Printf("%d, %d : %d\n", 12, 3, binomial(12,3))
+
+	fmt.Printf("Place fair: %d; All subset place fair: %d; Perm fair: %d\n", placefaircount, allsubsetplacefaircount, permfaircount)
 
 }
 
@@ -100,6 +118,82 @@ func findperms(dstr []string) map[string]int {
 
 	return perms
 }
+
+
+func ispermfair(perms map[string]int) bool {
+
+	// Permutations of length l
+	for l := uint8(2); l <= DICE; l++ {
+
+		permtarget := intpow(SIDES, l) / factorial(l)
+
+		for p := range perms {
+			if len(p) == int(l) {
+				if uint64(perms[p]) != permtarget {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
+}
+
+
+func isallsubsetplacefair(perms map[string]int) bool {
+
+	subsets := make(map[string]map[string][]uint64)
+	var subsetgoals [DICE - 1]uint64
+
+	for i := uint8(0); i < DICE - 1; i++ {
+		subsetgoals[i] = intpow(SIDES, i + 2) / (uint64(i) + 2)
+	}
+
+	for p := range perms {
+		l := len(p)
+
+		if l > 1 {
+
+			letlist := strings.Split(p, ``)
+			sort.Strings(letlist)
+			subset := strings.Join(letlist, ``)
+
+			if _, ok := subsets[subset]; ok == false {
+				subsets[subset] = make(map[string][]uint64)
+
+
+				for _, a := range letlist {
+					subsets[subset][a] = make([]uint64, l)
+				}
+			}
+
+			for i := 0; i < l; i++ {
+				a := p[i:i + 1]
+
+				subsets[subset][a][i] += uint64(perms[p])
+			}
+		}
+	}
+
+	for subset := range subsets {
+		for a := range subsets[subset] {
+
+			l := len(subset)
+			for _, s := range subsets[subset][a] {
+				if s != subsetgoals[l - 2] {
+
+					//fmt.Printf("Subset %s with letter %s failed. Got %d, expected %d\n",
+					//	subset, a, s, subsetgoals[l - 2])
+
+					return false
+				}
+			}
+		}
+	}
+
+	return true
+}
+
 
 
 func printperms(perms map[string]int) {
@@ -225,7 +319,7 @@ func build_tally_table() placetally {
 
 
 func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
-	min_tally *tallyleft, max_tally *tallyleft) {
+	min_tally *tallytable, max_tally *tallytable) {
 
 	l := SIDES // The limit
 
@@ -262,4 +356,104 @@ func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 
 		} // end for s
 	}
+}
+
+
+func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side uint8,
+	tally_table *placetally, min_tally *tallytable, max_tally *tallytable) {
+
+
+	// We've gotten to the end of a dice, move on to the next or check results
+	if side >= SIDES {
+
+		// Check for place fairness
+		for pl := uint8(0); pl < DICE; pl ++ {
+			if (*curtally)[pl] != TALLYGOAL {
+				return
+			}
+		}
+
+		// If there are any dice left, move on to them
+		if row < (DICE - 1) {
+			var zerotally runningtally
+
+			for pl := uint8(0); pl < DICE; pl++ {
+				zerotally[pl] = 0
+			}
+
+			fill_table_by_row(dset, &zerotally, row + 1, 0, tally_table, min_tally, max_tally)
+
+			return;
+		} else {
+			// This means we have now filled out all the dice
+
+			dstr := setstring(*dset)
+			//fmt.Printf("Got placefair set: %s\n", strings.Join(dstr, ``))
+			placefaircount++
+
+			perms := findperms(dstr)
+
+			if ispermfair(perms) {
+				permfaircount++
+				fmt.Printf("Got permfair set: %s\n", strings.Join(dstr, ``))
+			} else if isallsubsetplacefair(perms) {
+				allsubsetplacefaircount++
+				fmt.Printf("Got allsubsetplacefair set: %s\n", strings.Join(dstr, ``))
+			}
+
+
+			return
+		}
+	}
+
+	// Each time we start on a new row build the tally table min/max using the previous rows
+	if side == 0 && row != DICE {
+		find_tally_left(dset, row, tally_table, min_tally, max_tally)
+	}
+
+	// Try to prune based on the runny tally and the min/max
+	for pl := uint8(0); pl < DICE; pl++ {
+		// If the current running tally plus the max doesn't reach our goal
+		if (*curtally)[pl] + max_tally[row][side][pl] < TALLYGOAL {
+			return
+		}
+
+		// If the current running tally plus the min goes over our goal
+		if (*curtally)[pl] + min_tally[row][side][pl] > TALLYGOAL {
+			return
+		}
+	}
+
+	// At this point we are still in the recursion and need to fill out
+	// more columns for this row
+
+	for d := row; d < DICE; d++ {
+
+		// To hold the new diceset each time we change it
+		// Copy current dice set to new one
+		var newd diceset
+		for nd := uint8(0); nd < DICE; nd++ {
+			for ns := uint8(0); ns < SIDES; ns++ {
+				newd[nd][ns] = (*dset)[nd][ns]
+			}
+		}
+
+		// Swap out the cell in this row with one below
+		newd[row][side] = (*dset)[d][side]
+		newd[d][side] = (*dset)[row][side]
+
+		// Duplicate the running tally table to local copy
+		var newtally runningtally
+		for pl:= uint8(0); pl < DICE; pl++ {
+			// Now that we've chosen a value, add it to our running tallies
+			newtally[pl] = (*curtally)[pl] + tally_table[newd[row][side]][pl];
+		}
+
+		fill_table_by_row(&newd, &newtally, row, side + 1, tally_table, min_tally, max_tally)
+
+		// If this is the first column we don't permute it
+		if side == 0 {
+			break
+		}
+	} // End swapping in of lower cells in this column
 }
