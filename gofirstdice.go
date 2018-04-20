@@ -11,7 +11,7 @@ import (
 
 const (
 	DICE = uint8(4)
-	SIDES = uint8(12)
+	SIDES = uint8(18)
 )
 
 var (
@@ -68,7 +68,7 @@ func main() {
 
 	fill_table_by_row(&dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally)
 
-	//fmt.Printf("Got str: %s\n", strings.Join(setstring(dset), ``))
+	//fmt.Printf("Got str: %s\n", strings.Join(setstring(dset, DICE), ``))
 
 	//printperms(findperms(strings.Split("abcdeecdabdbaececdabbecdadbcaeacbdeecdabbeacdeabdcdacebbacdedcaebacbdeabcdeedcbaedbcabeacdedcabbecadcdbaedcaebbadceedbcaeacbdadcebbadceceabdbadceedcba", ``)))
 
@@ -82,21 +82,23 @@ func main() {
 }
 
 
-func setstring(dset diceset) []string {
+func setstring(dset diceset, dcount uint8) []string {
 
 	dstr := make([]string, DICE * SIDES)
 
-	for i := uint8(0); i < (DICE * SIDES); i++ {
-		s := i / DICE;
-		for d := uint8(0); d < DICE; d++ {
-			if dset[d][s] == i {
-				dstr[i] = dlet[d]
+	l := 0 // track the length of the string made
+	for v := uint8(0); v < (DICE * SIDES); v++ {
+		s := v / DICE;
+		for d := uint8(0); d < dcount; d++ {
+			if dset[d][s] == v {
+				dstr[l] = dlet[d]
+				l++
 				break
 			}
 		}
 	}
 
-	return dstr
+	return dstr[0:l]
 }
 
 
@@ -120,10 +122,10 @@ func findperms(dstr []string) map[string]int {
 }
 
 
-func ispermfair(perms map[string]int) bool {
+func ispermfair(perms map[string]int, dcount uint8) bool {
 
 	// Permutations of length l
-	for l := uint8(2); l <= DICE; l++ {
+	for l := uint8(2); l <= dcount; l++ {
 
 		permtarget := intpow(SIDES, l) / factorial(l)
 
@@ -140,7 +142,7 @@ func ispermfair(perms map[string]int) bool {
 }
 
 
-func isallsubsetplacefair(perms map[string]int) bool {
+func isallsubsetplacefair(perms map[string]int, dcount uint8) bool {
 
 	// A subset is an ordered set of letters like acd
 	// The second map is an individual letter like c
@@ -150,7 +152,7 @@ func isallsubsetplacefair(perms map[string]int) bool {
 
 	// Computer the goal sum for each place for each letter in each subset
 	var subsetgoals [DICE - 1]uint64
-	for i := uint8(0); i < DICE - 1; i++ {
+	for i := uint8(0); i < dcount - 1; i++ {
 		subsetgoals[i] = intpow(SIDES, i + 2) / (uint64(i) + 2)
 	}
 
@@ -441,8 +443,19 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 			}
 
 			// Check pairwise fairness up to this point
+			// This check is much faster than checking all
+			// subset fairness so we do that first
 			for d1 := uint8(0); d1 < row; d1++ {
 				if checkpairsfair(dset, d1, row) == false {
+					return
+				}
+			}
+
+			// Now we can check that all subsets are fair up to here
+			if row > 1 && row < (DICE - 1) {
+				dstrlist := setstring(*dset, row + 1)
+				perms := findperms(dstrlist)
+				if isallsubsetplacefair(perms, row + 1) == false {
 					return
 				}
 			}
@@ -461,17 +474,17 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 			} else {
 				// This means we have now filled out all the dice
 
-				dstrlist := setstring(*dset)
+				dstrlist := setstring(*dset, DICE)
 				dstr := strings.Join(dstrlist, ``)
-				//fmt.Printf("Got placefair set: %s\n", dstr)
+				fmt.Printf("Got placefair set: %s\n", dstr)
 				placefaircount++
 
 				perms := findperms(dstrlist)
 
-				if ispermfair(perms) {
+				if ispermfair(perms, DICE) {
 				 	permfaircount++
 				 	fmt.Printf("Got permfair set: %s\n", dstr)
-				} else if isallsubsetplacefair(perms) {
+				} else if isallsubsetplacefair(perms, DICE) {
 				 	allsubsetplacefaircount++
 				 	fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
 				}
