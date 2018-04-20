@@ -4,14 +4,18 @@
 package main
 
 import (
+	"runtime"
 	"strings"
 	"fmt"
 	"sort"
+	"sync"
 )
 
 const (
 	DICE = uint8(4)
 	SIDES = uint8(18)
+	COLMASK = uint8(3) // Number of cols to permute before greating goroutine
+	THREADS = uint8(8) // Number of concurrent goroutines
 )
 
 var (
@@ -20,6 +24,8 @@ var (
 	permfaircount int
 	placefaircount int
 	allsubsetplacefaircount int
+	countermutex = &sync.Mutex{}
+	iomutex = &sync.Mutex{}
 )
 
 var (
@@ -41,32 +47,16 @@ func (a SortPerms) Less(i, j int) bool {if len(a[i]) == len(a[j]) {return a[i] <
 
 func main() {
 
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	fmt.Printf("Running on %d CPUs\n", runtime.GOMAXPROCS(0))
+
 	PERMGOAL = intpow(SIDES, DICE) / factorial(DICE)
 	TALLYGOAL = intpow(SIDES, DICE) / uint64(DICE)
 	permfaircount = 0
 	placefaircount = 0
 	allsubsetplacefaircount = 0
 
-	var dset diceset
-
-	for d := uint8(0); d < DICE; d++ {
-		for s := uint8(0); s < SIDES; s++ {
-			dset[d][s] = (uint8(s) * DICE) + uint8(d)
-		}
-	}
-
-	tally_table := build_tally_table()
-	var min_tally, max_tally tallytable
-
-	find_tally_left(&dset, 0, &tally_table, &min_tally, &max_tally)
-
-	var zerotally runningtally
-
-	for pl := uint8(0); pl < DICE; pl++ {
-		zerotally[pl] = 0
-	}
-
-	fill_table_by_row(&dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally)
+	threaded_fill_table_by_row()
 
 	//fmt.Printf("Got str: %s\n", strings.Join(setstring(dset, DICE), ``))
 
@@ -395,6 +385,92 @@ func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 }
 
 
+func threaded_fill_table_by_row() {
+
+	var threadwait = make(chan bool, THREADS)
+	waitgroup := sync.WaitGroup{}
+
+	var dset diceset
+	for d := uint8(0); d < DICE; d++ {
+		for s := uint8(0); s < SIDES; s++ {
+			dset[d][s] = (uint8(s) * DICE) + uint8(d)
+		}
+	}
+
+	tally_table := build_tally_table()
+	var min_tally, max_tally tallytable
+
+	find_tally_left(&dset, 0, &tally_table, &min_tally, &max_tally)
+
+	var zerotally runningtally
+
+	for pl := uint8(0); pl < DICE; pl++ {
+		zerotally[pl] = 0
+	}
+
+	// This function permutes the first colmask columns and then calls
+	// a goroutine to permute the rest
+
+	var permute func(*diceset, uint8, uint8)
+	permute = func(dset *diceset, row uint8, side uint8) {
+
+		if side >= COLMASK {
+			// If there are any dice left, move on to them
+			if row < (DICE - 1) {
+
+				permute(dset, row + 1, 0)
+
+				return;
+			} else {
+				// We've reached the end of the masked columns
+				// Now we need to do the rest of the perms for real
+
+				// Send a message over the buffered channel
+				// this will block if the channel is full and cause
+				// us to pause until a goroutine takes something
+				// out of the channel
+				threadwait <- true
+
+				waitgroup.Add(1)
+				go func() {
+					fill_table_by_row(dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally)
+
+					<-threadwait
+					waitgroup.Done()
+				}()
+
+				return
+			}
+		} else {
+			// Okay we still have more permuatitons to do for this column
+
+			for d := row; d < DICE; d++ {
+
+				var newdset diceset
+				// To hold the new diceset each time we change it
+				// Copy current dice set to new one
+				newdset = *dset
+
+				// Swap out the cell in this row with one below
+				newdset[row][side] = (*dset)[d][side]
+				newdset[d][side] = (*dset)[row][side]
+
+				permute(&newdset, row, side + 1)
+
+				// If this is the first column, we never permute it
+				if side == 0 {
+					break
+				}
+			}
+		}
+	}
+	// Start the permutations
+	permute(&dset, 0, 0)
+
+	waitgroup.Wait() // Wait for remaining goroutines to finish
+}
+
+
 func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side uint8,
 	tally_table *placetally, min_tally *tallytable, max_tally *tallytable) {
 
@@ -415,19 +491,13 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 	var curtallycache[DICE][SIDES + 1]runningtally
 
 	// Copy the passed curtally into the cache
-	for pl := uint8(0); pl < DICE; pl++ {
-		curtallycache[row][side][pl] = (*curtally)[pl]
-	}
+	curtallycache[row][side] = *curtally
 
 	// Pre-allocate a dset for each recursion call too
 	var dsetcache[DICE][SIDES + 1]diceset
 
 	// Copy the passed dset into the cache
-	for d := uint8(0); d < DICE; d++ {
-		for s := uint8(0); s < SIDES; s++ {
-			dsetcache[row][side][d][s] = (*dset)[d][s]
-		}
-	}
+	dsetcache[row][side] = *dset
 
 	var search func(*diceset, *runningtally, uint8, uint8)
 	search = func(dset *diceset, curtally *runningtally, row uint8, side uint8) {
@@ -476,17 +546,33 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 
 				dstrlist := setstring(*dset, DICE)
 				dstr := strings.Join(dstrlist, ``)
-				fmt.Printf("Got placefair set: %s\n", dstr)
+
+				countermutex.Lock()
 				placefaircount++
+				countermutex.Unlock()
+
+				iomutex.Lock()
+				fmt.Printf("Got placefair set: %s\n", dstr)
+				iomutex.Unlock()
 
 				perms := findperms(dstrlist)
 
 				if ispermfair(perms, DICE) {
+					countermutex.Lock()
 				 	permfaircount++
+					countermutex.Unlock()
+
+					iomutex.Lock()
 				 	fmt.Printf("Got permfair set: %s\n", dstr)
+					iomutex.Unlock()
 				} else if isallsubsetplacefair(perms, DICE) {
+					countermutex.Lock()
 				 	allsubsetplacefaircount++
+					countermutex.Unlock()
+
+					iomutex.Lock()
 				 	fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
+					iomutex.Unlock()
 				}
 
 
@@ -519,11 +605,7 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 
 			// To hold the new diceset each time we change it
 			// Copy current dice set to new one
-			for nd := uint8(0); nd < DICE; nd++ {
-				for ns := uint8(0); ns < SIDES; ns++ {
-					dsetcache[row][side][nd][ns] = (*dset)[nd][ns]
-				}
-			}
+			dsetcache[row][side] = *dset
 
 			// Swap out the cell in this row with one below
 			dsetcache[row][side][row][side] = (*dset)[d][side]
@@ -537,8 +619,8 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 
 			search(&(dsetcache[row][side]), &(curtallycache[row][side]), row, side + 1)
 
-			// If this is the first column we don't permute it
-			if side == 0 {
+			// If this is a masked column we don't permute it
+			if side < COLMASK {
 				break
 			}
 		} // End swapping in of lower cells in this column

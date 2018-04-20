@@ -8,7 +8,7 @@ GO=go
 #CFLAGS=-Wall -Wextra -O0 -g
 
 # Graphite loop stuff
-CFLAGS=-Wall -Wextra -march=native -O2 -floop-interchange -fgraphite-identity -floop-block -floop-strip-mine
+CFLAGS=-Wall -Wextra -march=native -O3 -floop-interchange -fgraphite-identity -floop-block -floop-strip-mine -Wno-maybe-uninitialized
 
 GOFILES=gofirstdice.go
 
