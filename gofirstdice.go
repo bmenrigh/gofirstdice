@@ -13,9 +13,13 @@ import (
 
 const (
 	DICE = uint8(4)
-	SIDES = uint8(18)
+	SIDES = uint8(12)
 	COLMASK = uint8(3) // Number of cols to permute before greating goroutine
 	THREADS = uint8(8) // Number of concurrent goroutines
+	PATHSIZE = uint64(5185)     // (SIDES^DICE / DICE) + 1 // 4x12
+	//PATHSIZE = uint64(26245)    // (SIDES^DICE / DICE) + 1 // 4x18
+	//PATHSIZE = uint64(202501)   // (SIDES^DICE / DICE) + 1 // 4x30
+	//PATHSIZE = uint64(4860001)  // (SIDES^DICE / DICE) + 1 // 5x30
 )
 
 var (
@@ -36,6 +40,7 @@ type diceset [DICE][SIDES]uint8
 type placetally [DICE * SIDES][DICE]uint64 // [value] then [place]
 type tallytable [DICE][SIDES][DICE]uint64   // [row] then [column] then [place]
 type runningtally [DICE]uint64   // [place]
+type pathtable [SIDES + 1][DICE][PATHSIZE]uint8 // [column] then [place] then [place sum number]
 
 
 // Sorting of permutations
@@ -335,10 +340,16 @@ func build_tally_table() placetally {
 						intpow(s, ((DICE - d) - 1) - (p - abv));
 				}
 
-				// fmt.Printf("n=%d, p=%d, c=%d\n", (s * DICE) + d, p, tally_cache[v][p]);
+				//fmt.Printf("n=%d, p=%d, c=%d\n", (s * DICE) + d, p, tally_cache[v][p]);
 			}
 		}
 	}
+
+	// for v := uint64(0); v < uint64(SIDES) * uint64(DICE); v++ {
+	// 	for p := uint8(0); p < DICE; p++ {
+	// 		fmt.Printf("tally v: %d; p: %d; t: %d\n", v, p, tally_cache[v][p])
+	// 	}
+	// }
 
 	return tally_cache
 }
@@ -347,17 +358,17 @@ func build_tally_table() placetally {
 func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 	min_tally *tallytable, max_tally *tallytable) {
 
-	l := SIDES // The limit
+	l := int8(SIDES - 1) // The limit
 
 	for p := uint8(0); p < DICE; p++ { // for each place
-		for s := l; s >= 1; s-- { // start from last to first
+		for s := l; s >= 0; s-- { // start from last to first
 			min := intpow(SIDES, DICE)
 			max := uint64(0)
 
 			for d := row; d < DICE; d++ { // for each dice you could pick
-				v := (*dset)[d][s - 1]; // The value
+				v := (*dset)[d][s]; // The value
 
-				t := tally_table[v][p]
+				t := (*tally_table)[v][p]
 
 				if (t < min) {
 					min = t
@@ -372,16 +383,54 @@ func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 
 			// If this is the last column it doesn't get added to the next higher column
 			if (s == l) {
-				(*min_tally)[row][s - 1][p] = min;
-				(*max_tally)[row][s - 1][p] = max;
+				(*min_tally)[row][s][p] = min;
+				(*max_tally)[row][s][p] = max;
 			} else {
-				(*min_tally)[row][s - 1][p] = min + (*min_tally)[row][s][p];
-				(*max_tally)[row][s - 1][p] = max + (*max_tally)[row][s][p];
+				(*min_tally)[row][s][p] = min + (*min_tally)[row][s + 1][p];
+				(*max_tally)[row][s][p] = max + (*max_tally)[row][s + 1][p];
 			}
 			// fmt.Printf("Bringing min,max for s=%d; p=%d to %d, %d\n", s, p, (*min_tally)[row][s - 1][p], (*max_tally)[row][s - 1][p]);
 
 		} // end for s
 	}
+}
+
+
+func find_tally_path(dset *diceset, tally_table *placetally, path_table *pathtable) {
+
+	for p := uint8(0); p < DICE; p++ { // for each place
+		for s := int8(SIDES); s >= 0; s-- { // start from last to first
+
+			// Zero out all all the numbers here
+			for n := uint64(0); n < PATHSIZE; n++ {
+				(*path_table)[s][p][n] = 0
+			}
+
+			if (s == int8(SIDES)) {
+				// The very end starts with the tally goal
+				(*path_table)[s][p][TALLYGOAL] = 1
+			} else {
+
+				for d := uint8(0); d < DICE; d++ { // for each dice you could pick
+					v := (*dset)[d][s]; // The value
+
+					t := (*tally_table)[v][p] // The tally
+
+					for n := t; n < PATHSIZE; n++ {
+						// If the next row up had this number
+						// we should subtract the current tally
+						// to find the possible number for this row
+
+						if (*path_table)[s + 1][p][n] == 1 {
+							(*path_table)[s][p][n - t] = 1
+
+							//fmt.Printf("path_table r: %d; s: %d; p: %d, n: %d\n", row, s, p, n - t);
+						}
+					}
+				} // end for d
+			} // end is last row
+		} // end for s
+	} // end for place
 }
 
 
@@ -397,11 +446,18 @@ func threaded_fill_table_by_row() {
 		}
 	}
 
+	// Compute the per-number tally
 	tally_table := build_tally_table()
-	var min_tally, max_tally tallytable
 
+	// Build the min/max tally
+	var min_tally, max_tally tallytable
 	find_tally_left(&dset, 0, &tally_table, &min_tally, &max_tally)
 
+	// Build the tally path
+	var path_table pathtable
+	find_tally_path(&dset, &tally_table, &path_table)
+
+	// Start out with zeroed tally
 	var zerotally runningtally
 
 	for pl := uint8(0); pl < DICE; pl++ {
@@ -433,7 +489,7 @@ func threaded_fill_table_by_row() {
 
 				waitgroup.Add(1)
 				go func() {
-					fill_table_by_row(dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally)
+					fill_table_by_row(dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally, &path_table)
 
 					<-threadwait
 					waitgroup.Done()
@@ -472,18 +528,13 @@ func threaded_fill_table_by_row() {
 
 
 func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side uint8,
-	tally_table *placetally, min_tally *tallytable, max_tally *tallytable) {
+	tally_table *placetally, min_tally *tallytable, max_tally *tallytable, path_table *pathtable) {
 
 	// Make local copies of the min/max tally tables
-	var loc_min_tally, loc_max_tally tallytable
-	for d := uint8(0); d < DICE; d++ {
-		for s := uint8(0); s < SIDES; s++ {
-			for pl := uint8(0); pl < DICE; pl++ {
-				loc_min_tally[d][s][pl] = (*min_tally)[d][s][pl]
-				loc_max_tally[d][s][pl] = (*max_tally)[d][s][pl]
-			}
-		}
-	}
+	loc_min_tally, loc_max_tally := *min_tally, *max_tally
+
+	// Make local copy of the path_table
+	loc_path_table := *path_table
 
 	// Pre-allocate a runningtally for each recursion call so we
 	// don't have to constantly make a new one and have the GC
@@ -551,9 +602,9 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				placefaircount++
 				countermutex.Unlock()
 
-				iomutex.Lock()
-				fmt.Printf("Got placefair set: %s\n", dstr)
-				iomutex.Unlock()
+				//iomutex.Lock()
+				//fmt.Printf("Got placefair set: %s\n", dstr)
+				//iomutex.Unlock()
 
 				perms := findperms(dstrlist)
 
@@ -583,17 +634,26 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 		// Each time we start on a new row build the tally table min/max using the previous rows
 		if side == 0 && row != DICE {
 			find_tally_left(dset, row, tally_table, &loc_min_tally, &loc_max_tally)
+			//find_tally_path(dset, tally_table, &loc_path_table)
 		}
 
 		// Try to prune based on the runny tally and the min/max
 		for pl := uint8(0); pl < DICE; pl++ {
+			t := (*curtally)[pl] // the current tally
+
 			// If the current running tally plus the max doesn't reach our goal
-			if (*curtally)[pl] + loc_max_tally[row][side][pl] < TALLYGOAL {
+			if t + loc_max_tally[row][side][pl] < TALLYGOAL {
 				return
 			}
 
 			// If the current running tally plus the min goes over our goal
-			if (*curtally)[pl] + loc_min_tally[row][side][pl] > TALLYGOAL {
+			if t + loc_min_tally[row][side][pl] > TALLYGOAL {
+				return
+			}
+
+			// If there is no path from here
+			if loc_path_table[side][pl][t] == 0 {
+				//fmt.Printf("Pruning. Got no path for row %d; side %d; pl %d; t %d\n", row, side, pl, t);
 				return
 			}
 		}
