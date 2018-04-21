@@ -439,10 +439,20 @@ func threaded_fill_table_by_row() {
 	var threadwait = make(chan bool, THREADS)
 	waitgroup := sync.WaitGroup{}
 
+	// Build the dice set table
+	// The whole space gets searched no matter what the permutation of the
+	// initial dice set is.
+	// Permuting it "nicely" probably reduces the time to the first
+	// solution found
 	var dset diceset
 	for d := uint8(0); d < DICE; d++ {
-		for s := uint8(0); s < SIDES; s++ {
+		// Make even columns ascending
+		for s := uint8(0); s < SIDES; s += 2 {
 			dset[d][s] = (uint8(s) * DICE) + uint8(d)
+		}
+		// And odd columns descending
+		for s := uint8(1); s < SIDES; s += 2 {
+			dset[d][s] = (uint8(s) * DICE) + ((DICE - 1) - uint8(d))
 		}
 	}
 
@@ -533,9 +543,6 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 	// Make local copies of the min/max tally tables
 	loc_min_tally, loc_max_tally := *min_tally, *max_tally
 
-	// Make local copy of the path_table
-	loc_path_table := *path_table
-
 	// Pre-allocate a runningtally for each recursion call so we
 	// don't have to constantly make a new one and have the GC
 	// constantly collecting them
@@ -582,7 +589,7 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 			}
 
 			// If there are any dice left, move on to them
-			if row < (DICE - 1) {
+			if row < (DICE - 2) {
 
 				// We're starting a new row, zero out the tally
 				for pl := uint8(0); pl < DICE; pl++ {
@@ -602,9 +609,9 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				placefaircount++
 				countermutex.Unlock()
 
-				//iomutex.Lock()
-				//fmt.Printf("Got placefair set: %s\n", dstr)
-				//iomutex.Unlock()
+				iomutex.Lock()
+				fmt.Printf("Got placefair set: %s\n", dstr)
+				iomutex.Unlock()
 
 				perms := findperms(dstrlist)
 
@@ -634,7 +641,6 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 		// Each time we start on a new row build the tally table min/max using the previous rows
 		if side == 0 && row != DICE {
 			find_tally_left(dset, row, tally_table, &loc_min_tally, &loc_max_tally)
-			//find_tally_path(dset, tally_table, &loc_path_table)
 		}
 
 		// Try to prune based on the runny tally and the min/max
@@ -652,7 +658,7 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 			}
 
 			// If there is no path from here
-			if loc_path_table[side][pl][t] == 0 {
+			if (*path_table)[side][pl][t] == 0 {
 				//fmt.Printf("Pruning. Got no path for row %d; side %d; pl %d; t %d\n", row, side, pl, t);
 				return
 			}
