@@ -5,6 +5,7 @@ package main
 
 import (
 	"runtime"
+	"os"
 	"strings"
 	"fmt"
 	"sort"
@@ -27,6 +28,7 @@ var (
 	TALLYGOAL uint64
 	permfaircount int
 	placefaircount int
+	threadcount int
 	allsubsetplacefaircount int
 	countermutex = &sync.Mutex{}
 	iomutex = &sync.Mutex{}
@@ -41,6 +43,7 @@ type placetally [DICE * SIDES][DICE]uint64 // [value] then [place]
 type tallytable [DICE][SIDES][DICE]uint64   // [row] then [column] then [place]
 type runningtally [DICE]uint64   // [place]
 type pathtable [SIDES + 1][DICE][PATHSIZE]uint8 // [column] then [place] then [place sum number]
+type balance [DICE][DICE]uint8 // [die] and then count of mod dice
 
 
 // Sorting of permutations
@@ -53,7 +56,7 @@ func (a SortPerms) Less(i, j int) bool {if len(a[i]) == len(a[j]) {return a[i] <
 func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	fmt.Printf("Running on %d CPUs\n", runtime.GOMAXPROCS(0))
+	fmt.Fprintf(os.Stderr, "Running on %d CPUs\n", runtime.GOMAXPROCS(0))
 
 	PERMGOAL = intpow(SIDES, DICE) / factorial(DICE)
 	TALLYGOAL = intpow(SIDES, DICE) / uint64(DICE)
@@ -72,7 +75,7 @@ func main() {
 
 	//fmt.Printf("%d, %d : %d\n", 12, 3, binomial(12,3))
 
-	fmt.Printf("Place fair: %d; All subset place fair: %d; Perm fair: %d\n", placefaircount, allsubsetplacefaircount, permfaircount)
+	fmt.Fprintf(os.Stderr, "Place fair: %d; All subset place fair: %d; Perm fair: %d\n", placefaircount, allsubsetplacefaircount, permfaircount)
 
 }
 
@@ -114,6 +117,34 @@ func findperms(dstr []string) map[string]int {
 	}
 
 	return perms
+}
+
+
+func findbalance (dset *diceset) balance {
+
+	var btable balance
+
+	for d := uint8(0); d < DICE; d++ {
+		for s := uint8(0); s < SIDES; s++ {
+			btable[d][(*dset)[d][s] % DICE] += 1
+		}
+	}
+
+	return btable
+}
+
+
+func printbalance (btable balance) {
+
+	fmt.Fprintf(os.Stderr, "--------------------\n")
+	for d := uint8(0); d < DICE; d++ {
+		fmt.Fprintf(os.Stderr, "d%d: ", d)
+		for p := uint8(0); p < DICE; p++ {
+			fmt.Fprintf(os.Stderr, " | %2d", btable[d][p])
+		}
+		fmt.Fprintf(os.Stderr, " |\n")
+	}
+	fmt.Fprintf(os.Stderr, "\n")
 }
 
 
@@ -237,7 +268,7 @@ func printperms(perms map[string]int) {
 	sort.Sort(SortPerms(pnames))
 
 	for _, p := range pnames {
-		fmt.Printf("\"%s\" -> %d\n", p, perms[p])
+		fmt.Fprintf(os.Stderr, "\"%s\" -> %d\n", p, perms[p])
 	}
 }
 
@@ -340,14 +371,14 @@ func build_tally_table() placetally {
 						intpow(s, ((DICE - d) - 1) - (p - abv));
 				}
 
-				//fmt.Printf("n=%d, p=%d, c=%d\n", (s * DICE) + d, p, tally_cache[v][p]);
+				//fmt.Fprintf(os.Stderr, "n=%d, p=%d, c=%d\n", (s * DICE) + d, p, tally_cache[v][p]);
 			}
 		}
 	}
 
 	// for v := uint64(0); v < uint64(SIDES) * uint64(DICE); v++ {
 	// 	for p := uint8(0); p < DICE; p++ {
-	// 		fmt.Printf("tally v: %d; p: %d; t: %d\n", v, p, tally_cache[v][p])
+	// 		fmt.Fprintf(os.Stderr, "tally v: %d; p: %d; t: %d\n", v, p, tally_cache[v][p])
 	// 	}
 	// }
 
@@ -389,7 +420,7 @@ func find_tally_left(dset *diceset, row uint8, tally_table *placetally,
 				(*min_tally)[row][s][p] = min + (*min_tally)[row][s + 1][p];
 				(*max_tally)[row][s][p] = max + (*max_tally)[row][s + 1][p];
 			}
-			// fmt.Printf("Bringing min,max for s=%d; p=%d to %d, %d\n", s, p, (*min_tally)[row][s - 1][p], (*max_tally)[row][s - 1][p]);
+			// fmt.Fprintf(os.Stderr, "Bringing min,max for s=%d; p=%d to %d, %d\n", s, p, (*min_tally)[row][s - 1][p], (*max_tally)[row][s - 1][p]);
 
 		} // end for s
 	}
@@ -424,7 +455,7 @@ func find_tally_path(dset *diceset, tally_table *placetally, path_table *pathtab
 						if (*path_table)[s + 1][p][n] == 1 {
 							(*path_table)[s][p][n - t] = 1
 
-							//fmt.Printf("path_table r: %d; s: %d; p: %d, n: %d\n", row, s, p, n - t);
+							//fmt.Fprintf(os.Stderr, "path_table r: %d; s: %d; p: %d, n: %d\n", row, s, p, n - t);
 						}
 					}
 				} // end for d
@@ -438,6 +469,7 @@ func threaded_fill_table_by_row() {
 
 	var threadwait = make(chan bool, THREADS)
 	waitgroup := sync.WaitGroup{}
+	threadcount = 1
 
 	// Build the dice set table
 	// The whole space gets searched no matter what the permutation of the
@@ -498,12 +530,25 @@ func threaded_fill_table_by_row() {
 				threadwait <- true
 
 				waitgroup.Add(1)
-				go func() {
+				go func(tnum int) {
+
+					iomutex.Lock()
+				 	fmt.Fprintf(os.Stderr, "[STARTING WORKER THREAD #%d]\n", tnum)
+					iomutex.Unlock()
+
 					fill_table_by_row(dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally, &path_table)
 
 					<-threadwait
+
 					waitgroup.Done()
-				}()
+
+					iomutex.Lock()
+					fmt.Fprintf(os.Stderr, "[FINISHED WORKER THREAD #%d]\n", tnum)
+					iomutex.Unlock()
+
+				}(threadcount)
+
+				threadcount++
 
 				return
 			}
@@ -609,9 +654,9 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				placefaircount++
 				countermutex.Unlock()
 
-				iomutex.Lock()
-				fmt.Printf("Got placefair set: %s\n", dstr)
-				iomutex.Unlock()
+				//iomutex.Lock()
+				//fmt.Printf("Got placefair set: %s\n", dstr)
+				//iomutex.Unlock()
 
 				perms := findperms(dstrlist)
 
@@ -622,15 +667,16 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 
 					iomutex.Lock()
 				 	fmt.Printf("Got permfair set: %s\n", dstr)
+					//printbalance(findbalance(dset))
 					iomutex.Unlock()
 				} else if isallsubsetplacefair(perms, DICE) {
 					countermutex.Lock()
 				 	allsubsetplacefaircount++
 					countermutex.Unlock()
 
-					iomutex.Lock()
-				 	fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
-					iomutex.Unlock()
+					//iomutex.Lock()
+				 	//fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
+					//iomutex.Unlock()
 				}
 
 
