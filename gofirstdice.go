@@ -14,11 +14,11 @@ import (
 
 const (
 	DICE = uint8(4)
-	SIDES = uint8(12)
+	SIDES = uint8(18)
 	COLMASK = uint8(3) // Number of cols to permute before greating goroutine
 	THREADS = uint8(8) // Number of concurrent goroutines
-	PATHSIZE = uint64(5185)     // (SIDES^DICE / DICE) + 1 // 4x12
-	//PATHSIZE = uint64(26245)    // (SIDES^DICE / DICE) + 1 // 4x18
+	//PATHSIZE = uint64(5185)     // (SIDES^DICE / DICE) + 1 // 4x12
+	PATHSIZE = uint64(26245)    // (SIDES^DICE / DICE) + 1 // 4x18
 	//PATHSIZE = uint64(202501)   // (SIDES^DICE / DICE) + 1 // 4x30
 	//PATHSIZE = uint64(4860001)  // (SIDES^DICE / DICE) + 1 // 5x30
 )
@@ -28,6 +28,7 @@ var (
 	TALLYGOAL uint64
 	permfaircount int
 	placefaircount int
+	firstdicecount uint64
 	threadcount int
 	allsubsetplacefaircount int
 	countermutex = &sync.Mutex{}
@@ -44,6 +45,7 @@ type tallytable [DICE][SIDES][DICE]uint64   // [row] then [column] then [place]
 type runningtally [DICE]uint64   // [place]
 type pathtable [SIDES + 1][DICE][PATHSIZE]uint8 // [column] then [place] then [place sum number]
 type balance [DICE][DICE]uint8 // [die] and then count of mod dice
+type runningbalance [DICE]uint8 // count of mod dice
 
 
 // Sorting of permutations
@@ -63,6 +65,7 @@ func main() {
 	permfaircount = 0
 	placefaircount = 0
 	allsubsetplacefaircount = 0
+	firstdicecount = 0
 
 	threaded_fill_table_by_row()
 
@@ -506,6 +509,13 @@ func threaded_fill_table_by_row() {
 		zerotally[pl] = 0
 	}
 
+	// Start out with zeroed balance
+	var zerobalance runningbalance
+
+	for pl := uint8(0); pl < DICE; pl++ {
+		zerobalance[pl] = 0
+	}
+
 	// This function permutes the first colmask columns and then calls
 	// a goroutine to permute the rest
 
@@ -532,19 +542,20 @@ func threaded_fill_table_by_row() {
 				waitgroup.Add(1)
 				go func(tnum int) {
 
-					iomutex.Lock()
-				 	fmt.Fprintf(os.Stderr, "[STARTING WORKER THREAD #%d]\n", tnum)
-					iomutex.Unlock()
+					//iomutex.Lock()
+				 	//fmt.Fprintf(os.Stderr, "[STARTING WORKER THREAD #%d]\n", tnum)
+					//iomutex.Unlock()
 
-					fill_table_by_row(dset, &zerotally, 0, 0, &tally_table, &min_tally, &max_tally, &path_table)
+					fill_table_by_row(dset, &zerotally, &zerobalance, 0, 0, &tally_table, &min_tally, &max_tally, &path_table)
 
 					<-threadwait
 
 					waitgroup.Done()
 
-					iomutex.Lock()
-					fmt.Fprintf(os.Stderr, "[FINISHED WORKER THREAD #%d]\n", tnum)
-					iomutex.Unlock()
+					//iomutex.Lock()
+					//fmt.Fprintf(os.Stderr, "[FINISHED WORKER THREAD #%d]\n", tnum)
+					//fmt.Fprintf(os.Stderr, "First dice found so far: %d\n", firstdicecount)
+					//iomutex.Unlock()
 
 				}(threadcount)
 
@@ -582,7 +593,7 @@ func threaded_fill_table_by_row() {
 }
 
 
-func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side uint8,
+func fill_table_by_row(dset *diceset, curtally *runningtally, curbalance *runningbalance, row uint8, side uint8,
 	tally_table *placetally, min_tally *tallytable, max_tally *tallytable, path_table *pathtable) {
 
 	// Make local copies of the min/max tally tables
@@ -596,14 +607,20 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 	// Copy the passed curtally into the cache
 	curtallycache[row][side] = *curtally
 
+	// Pre-allocate running balance
+	var curbalancecache[DICE][SIDES + 1]runningbalance
+
+	// Copy the passed curbalance into the cache
+	curbalancecache[row][side] = *curbalance
+
 	// Pre-allocate a dset for each recursion call too
 	var dsetcache[DICE][SIDES + 1]diceset
 
 	// Copy the passed dset into the cache
 	dsetcache[row][side] = *dset
 
-	var search func(*diceset, *runningtally, uint8, uint8)
-	search = func(dset *diceset, curtally *runningtally, row uint8, side uint8) {
+	var search func(*diceset, *runningtally, *runningbalance, uint8, uint8)
+	search = func(dset *diceset, curtally *runningtally, curbalance *runningbalance, row uint8, side uint8) {
 
 		// We've gotten to the end of a dice, move on to the next or check results
 		if side >= SIDES {
@@ -636,12 +653,24 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 			// If there are any dice left, move on to them
 			if row < (DICE - 2) {
 
+				// TESTING!
+				// return after first dice is filled out to count it
+				countermutex.Lock()
+				firstdicecount++
+				countermutex.Unlock()
+				//return
+
 				// We're starting a new row, zero out the tally
 				for pl := uint8(0); pl < DICE; pl++ {
 					curtallycache[row][side][pl] = 0
 				}
 
-				search(dset, &(curtallycache[row][side]), row + 1, 0)
+				// We're starting a new row, zero out the balance
+				for pl := uint8(0); pl < DICE; pl++ {
+					curbalancecache[row][side][pl] = 0
+				}
+
+				search(dset, &(curtallycache[row][side]), &(curbalancecache[row][side]), row + 1, 0)
 
 				return;
 			} else {
@@ -664,6 +693,38 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 					countermutex.Lock()
 				 	permfaircount++
 					countermutex.Unlock()
+
+					btable := findbalance(dset)
+
+					for d := uint8(0); d < DICE; d++ {
+						// Try to prune if the running balance is bad
+						bsum := uint8(0)
+						for b := uint8(0); b < (DICE / 2); b++ {
+							bsum += btable[d][b]
+						}
+						if DICE % 2 == 1 {
+							bsum += btable[d][(DICE / 2) + 1] / 2
+						}
+
+						// Now if the bsum is greater than SIDES / 2 it's out of balance
+						if bsum > (SIDES / 2) {
+							iomutex.Lock()
+							fmt.Printf("Got unbalanced set: %s\n", dstr)
+							fmt.Fprintf(os.Stderr, "Pruning. Balance too high: row %d; side %d; bsum %d\n", row, side, bsum);
+							printbalance(btable)
+							iomutex.Unlock()
+							//return
+						}
+						// Or if the current bsum + the remaining sides can't reach SIDES / 2
+						if bsum + (SIDES - side) < (SIDES / 2) {
+							iomutex.Lock()
+							fmt.Printf("Got unbalanced set: %s\n", dstr)
+							fmt.Fprintf(os.Stderr, "Pruning. Balance too low: row %d; side %d; bsum %d\n", row, side, bsum);
+							printbalance(btable)
+							iomutex.Unlock()
+							//return
+						}
+					}
 
 					iomutex.Lock()
 				 	fmt.Printf("Got permfair set: %s\n", dstr)
@@ -705,9 +766,29 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 
 			// If there is no path from here
 			if (*path_table)[side][pl][t] == 0 {
-				//fmt.Printf("Pruning. Got no path for row %d; side %d; pl %d; t %d\n", row, side, pl, t);
+				//fmt.Fprintf(os.Stderr, "Pruning. Got no path for row %d; side %d; pl %d; t %d\n", row, side, pl, t);
 				return
 			}
+		}
+
+		// Try to prune if the running balance is bad
+		bsum := uint8(0)
+		for b := uint8(0); b < (DICE / 2); b++ {
+			bsum += (*curbalance)[b]
+		}
+		if DICE % 2 == 1 {
+			bsum += (*curbalance)[(DICE / 2) + 1] / 2
+		}
+
+		// Now if the bsum is greater than SIDES / 2 it's out of balance
+		if bsum > (SIDES / 2) {
+			//fmt.Fprintf(os.Stderr, "Pruning. Balance too high: row %d; side %d; bsum %d\n", row, side, bsum);
+			//return
+		}
+		// Or if the current bsum + the remaining sides can't reach SIDES / 2
+		if bsum + (SIDES - side) < (SIDES / 2) {
+			//fmt.Fprintf(os.Stderr, "Pruning. Balance too low: row %d; side %d; bsum %d\n", row, side, bsum);
+			//return
 		}
 
 		// At this point we are still in the recursion and need to fill out
@@ -729,7 +810,12 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				curtallycache[row][side][pl] = (*curtally)[pl] + (*tally_table)[dsetcache[row][side][row][side]][pl];
 			}
 
-			search(&(dsetcache[row][side]), &(curtallycache[row][side]), row, side + 1)
+			// Now that we've chosen a value, copy our balance and then update it
+			curbalancecache[row][side] = (*curbalance)
+			// Update it with the d we've chosen
+			curbalancecache[row][side][dsetcache[row][side][row][side] % DICE]++
+
+			search(&(dsetcache[row][side]), &(curtallycache[row][side]), &(curbalancecache[row][side]), row, side + 1)
 
 			// If this is a masked column we don't permute it
 			if side < COLMASK {
@@ -739,5 +825,5 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 	} // End search() func
 
 	// Now call into our search function with the arguments we got
-	search(&(dsetcache[row][side]), &(curtallycache[row][side]), row, side)
+	search(&(dsetcache[row][side]), &(curtallycache[row][side]), &(curbalancecache[row][side]), row, side)
 }
