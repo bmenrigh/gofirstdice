@@ -21,6 +21,8 @@ const (
 	//PATHSIZE = uint64(26245)    // (SIDES^DICE / DICE) + 1 // 4x18
 	//PATHSIZE = uint64(202501)   // (SIDES^DICE / DICE) + 1 // 4x30
 	//PATHSIZE = uint64(4860001)  // (SIDES^DICE / DICE) + 1 // 5x30
+	//PATHSIZE = uint64(72001)  // (SIDES^DICE / DICE) + 1 // 3x60
+	//PATHSIZE = uint64(3240001)  // (SIDES^DICE / DICE) + 1 // 4x60
 )
 
 var (
@@ -654,9 +656,9 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				placefaircount++
 				countermutex.Unlock()
 
-				//iomutex.Lock()
-				//fmt.Printf("Got placefair set: %s\n", dstr)
-				//iomutex.Unlock()
+				iomutex.Lock()
+				fmt.Printf("Got placefair set: %s\n", dstr)
+				iomutex.Unlock()
 
 				perms := findperms(dstrlist)
 
@@ -674,9 +676,9 @@ func fill_table_by_row(dset *diceset, curtally *runningtally, row uint8, side ui
 				 	allsubsetplacefaircount++
 					countermutex.Unlock()
 
-					//iomutex.Lock()
-				 	//fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
-					//iomutex.Unlock()
+					iomutex.Lock()
+				 	fmt.Printf("Got allsubsetplacefair set: %s\n", dstr)
+					iomutex.Unlock()
 				}
 
 
