@@ -180,7 +180,7 @@ sub find_perms {
 	foreach my $pstr (sort keys %dperms) {
 
 	    if (index($pstr, $let) < 0) {
-		my $np = $pstr . $let;
+		my $np = $let . $pstr;
 
 		unless (exists $dperms{$np}) {
 		    $dperms{$np} = 0;
