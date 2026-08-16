@@ -49,6 +49,10 @@
 #define PERM_ONLY 0
 #endif
 
+#ifndef ADDITIVE_PERM_LINEAR
+#define ADDITIVE_PERM_LINEAR 1
+#endif
+
 #if MIRROR != 0 && MIRROR != 1
 #error "MIRROR must be either 0 or 1"
 #endif
@@ -61,7 +65,13 @@
 #error "PERM_ONLY must be either 0 or 1"
 #endif
 
+#if ADDITIVE_PERM_LINEAR != 0 && ADDITIVE_PERM_LINEAR != 1
+#error "ADDITIVE_PERM_LINEAR must be either 0 or 1"
+#endif
+
 #define ADDITIVE_PERM_BOUNDS_ACTIVE (PERM_ONLY && DICE >= 4)
+#define ADDITIVE_PERM_LINEAR_ACTIVE \
+    (ADDITIVE_PERM_BOUNDS_ACTIVE && ADDITIVE_PERM_LINEAR)
 
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
@@ -99,6 +109,9 @@
 #ifndef LINEAR_BOUND_STRIDE
 #define LINEAR_BOUND_STRIDE 2U
 #endif
+#ifndef ADDITIVE_PERM_LINEAR_BOUND_STRIDE
+#define ADDITIVE_PERM_LINEAR_BOUND_STRIDE 3U
+#endif
 
 /* Number of permutations and partial permutations, including the empty one. */
 #if DICE == 2
@@ -130,6 +143,23 @@
 #error "column_search supports DICE values from 2 through 6"
 #endif
 
+/*
+ * Track every pair through 24 permutations.  At 120 permutations, a basis
+ * comparing each tally with the first is sufficient to require equality and
+ * avoids 7,140 direction checks at every node.  The maximum remains 276.
+ */
+#define ADDITIVE_PERM_FULL_PAIR_LIMIT 24U
+#define ADDITIVE_PERM_FULL_PAIR_DIRECTIONS \
+    ((ADDITIVE_PERM_FULL_PAIR_LIMIT * \
+      (ADDITIVE_PERM_FULL_PAIR_LIMIT - 1U)) / 2U)
+#define MAX_ADDITIVE_PERM_DIRECTIONS \
+    (MAX_PREFIX_PERMUTATIONS <= ADDITIVE_PERM_FULL_PAIR_LIMIT ? \
+        ((MAX_PREFIX_PERMUTATIONS * (MAX_PREFIX_PERMUTATIONS - 1U)) / 2U) : \
+        (MAX_PREFIX_PERMUTATIONS - 1U > \
+             ADDITIVE_PERM_FULL_PAIR_DIRECTIONS ? \
+             MAX_PREFIX_PERMUTATIONS - 1U : \
+             ADDITIVE_PERM_FULL_PAIR_DIRECTIONS))
+
 _Static_assert(SIDES > 0, "SIDES must be positive");
 _Static_assert(PAIR_BOUND_START <= SEARCH_COLUMNS,
                "PAIR_BOUND_START exceeds the searched columns");
@@ -137,6 +167,8 @@ _Static_assert(LINEAR_BOUND_START <= SEARCH_COLUMNS,
                "LINEAR_BOUND_START exceeds the searched columns");
 _Static_assert(LINEAR_BOUND_STRIDE > 0,
                "LINEAR_BOUND_STRIDE must be positive");
+_Static_assert(ADDITIVE_PERM_LINEAR_BOUND_STRIDE > 0,
+               "ADDITIVE_PERM_LINEAR_BOUND_STRIDE must be positive");
 _Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
                "permutation state indices must fit in uint16_t");
 
@@ -188,6 +220,16 @@ struct additive_perm_bounds {
                          [MAX_PREFIX_PERMUTATIONS];
     uint64_t maximum_left[DICE][SEARCH_COLUMNS + 1]
                          [MAX_PREFIX_PERMUTATIONS];
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    uint16_t direction_first[DICE][MAX_ADDITIVE_PERM_DIRECTIONS];
+    uint16_t direction_second[DICE][MAX_ADDITIVE_PERM_DIRECTIONS];
+    unsigned direction_count[DICE];
+    bool linear_possible[DICE];
+    int64_t direction_minimum_left[DICE][SEARCH_COLUMNS + 1]
+                                  [MAX_ADDITIVE_PERM_DIRECTIONS];
+    int64_t direction_maximum_left[DICE][SEARCH_COLUMNS + 1]
+                                  [MAX_ADDITIVE_PERM_DIRECTIONS];
+#endif
 
     /* Reused only while one row's contribution table is constructed. */
     uint64_t above[FACE_COUNT][MAX_PREFIX_PERMUTATIONS];
@@ -247,6 +289,9 @@ struct search {
     uint64_t prefix_place_prunes;
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     uint64_t additive_perm_prunes;
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    uint64_t linear_perm_prunes;
+#endif
 #endif
     uint64_t all_subset_place_prunes;
     uint64_t all_subset_place_fair_count;
@@ -261,6 +306,9 @@ struct worker_stats {
     atomic_uint_fast64_t prefix_place_prunes;
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     atomic_uint_fast64_t additive_perm_prunes;
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    atomic_uint_fast64_t linear_perm_prunes;
+#endif
 #endif
     atomic_uint_fast64_t all_subset_place_prunes;
     atomic_uint_fast64_t all_subset_place_fair_count;
@@ -978,6 +1026,9 @@ static bool initialize_additive_perm_bounds(struct search *search)
             search->permutation_fairness_possible = false;
         } else {
             bounds->goal[row] = outcomes / factorial;
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+            bounds->linear_possible[row] = outcomes <= (uint64_t)INT64_MAX;
+#endif
         }
 
         for (state = counter->length_begin[dice_built];
@@ -1036,6 +1087,44 @@ static bool initialize_additive_perm_bounds(struct search *search)
             return false;
         }
         bounds->permutation_count[row] = permutation;
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+        {
+            unsigned direction = 0;
+
+            if (permutation <= ADDITIVE_PERM_FULL_PAIR_LIMIT) {
+                unsigned first;
+
+                for (first = 0; first < permutation; ++first) {
+                    unsigned second;
+
+                    for (second = first + 1U; second < permutation;
+                         ++second) {
+                        if (direction >= MAX_ADDITIVE_PERM_DIRECTIONS) {
+                            return false;
+                        }
+                        bounds->direction_first[row][direction] =
+                            (uint16_t)first;
+                        bounds->direction_second[row][direction] =
+                            (uint16_t)second;
+                        ++direction;
+                    }
+                }
+            } else {
+                unsigned second;
+
+                for (second = 1; second < permutation; ++second) {
+                    if (direction >= MAX_ADDITIVE_PERM_DIRECTIONS) {
+                        return false;
+                    }
+                    bounds->direction_first[row][direction] = 0;
+                    bounds->direction_second[row][direction] =
+                        (uint16_t)second;
+                    ++direction;
+                }
+            }
+            bounds->direction_count[row] = direction;
+        }
+#endif
     }
     return true;
 }
@@ -1043,6 +1132,22 @@ static bool initialize_additive_perm_bounds(struct search *search)
 static uint64_t saturating_add(uint64_t first, uint64_t second)
 {
     return UINT64_MAX - first < second ? UINT64_MAX : first + second;
+}
+
+static uint64_t additive_perm_contribution_at(
+    const struct search *search, const struct additive_perm_bounds *bounds,
+    unsigned row, unsigned candidate, unsigned actual_column,
+    unsigned permutation)
+{
+    unsigned face = search->grid[candidate][actual_column];
+    uint64_t contribution = bounds->contribution[row][face][permutation];
+
+#if MIRROR
+    unsigned mirror_column = SIDES - actual_column - 1U;
+    unsigned mirror_face = search->grid[candidate][mirror_column];
+    contribution += bounds->contribution[row][mirror_face][permutation];
+#endif
+    return contribution;
 }
 
 static void build_additive_perm_bounds(struct search *search, unsigned row)
@@ -1092,6 +1197,12 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
            sizeof(bounds->minimum_left[row][SEARCH_COLUMNS]));
     memset(bounds->maximum_left[row][SEARCH_COLUMNS], 0,
            sizeof(bounds->maximum_left[row][SEARCH_COLUMNS]));
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    memset(bounds->direction_minimum_left[row][SEARCH_COLUMNS], 0,
+           bounds->direction_count[row] * sizeof(int64_t));
+    memset(bounds->direction_maximum_left[row][SEARCH_COLUMNS], 0,
+           bounds->direction_count[row] * sizeof(int64_t));
+#endif
     column = SEARCH_COLUMNS;
     while (column-- > 0) {
         unsigned actual_column = ordered_column(search, row, column);
@@ -1103,17 +1214,9 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
             unsigned candidate;
 
             for (candidate = row; candidate < DICE; ++candidate) {
-                unsigned candidate_face =
-                    search->grid[candidate][actual_column];
-                uint64_t contribution =
-                    bounds->contribution[row][candidate_face][permutation];
-#if MIRROR
-                unsigned mirror_column = SIDES - actual_column - 1U;
-                unsigned mirror_face =
-                    search->grid[candidate][mirror_column];
-                contribution +=
-                    bounds->contribution[row][mirror_face][permutation];
-#endif
+                uint64_t contribution = additive_perm_contribution_at(
+                    search, bounds, row, candidate, actual_column,
+                    permutation);
                 if (contribution < minimum) {
                     minimum = contribution;
                 }
@@ -1126,6 +1229,49 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
             bounds->maximum_left[row][column][permutation] = saturating_add(
                 maximum, bounds->maximum_left[row][column + 1U][permutation]);
         }
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+        if (bounds->linear_possible[row]) {
+            unsigned direction;
+
+            for (direction = 0; direction < bounds->direction_count[row];
+                 ++direction) {
+                unsigned first = bounds->direction_first[row][direction];
+                unsigned second = bounds->direction_second[row][direction];
+                unsigned candidate = row;
+                int64_t minimum =
+                    (int64_t)additive_perm_contribution_at(
+                        search, bounds, row, candidate, actual_column,
+                        first) -
+                    (int64_t)additive_perm_contribution_at(
+                        search, bounds, row, candidate, actual_column,
+                        second);
+                int64_t maximum = minimum;
+
+                for (++candidate; candidate < DICE; ++candidate) {
+                    int64_t difference =
+                        (int64_t)additive_perm_contribution_at(
+                            search, bounds, row, candidate, actual_column,
+                            first) -
+                        (int64_t)additive_perm_contribution_at(
+                            search, bounds, row, candidate, actual_column,
+                            second);
+
+                    if (difference < minimum) {
+                        minimum = difference;
+                    }
+                    if (difference > maximum) {
+                        maximum = difference;
+                    }
+                }
+                bounds->direction_minimum_left[row][column][direction] =
+                    minimum + bounds->direction_minimum_left
+                        [row][column + 1U][direction];
+                bounds->direction_maximum_left[row][column][direction] =
+                    maximum + bounds->direction_maximum_left
+                        [row][column + 1U][direction];
+            }
+        }
+#endif
     }
 }
 
@@ -1153,27 +1299,56 @@ static bool additive_perm_bounds_allow_goal(const struct search *search,
     return true;
 }
 
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+static bool additive_perm_direction_bounds_allow_goal(
+    const struct search *search, unsigned row, unsigned column)
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    unsigned direction;
+
+    if (row < 2U || !bounds->linear_possible[row] ||
+        column == SEARCH_COLUMNS) {
+        return true;
+    }
+#if ADDITIVE_PERM_LINEAR_BOUND_STRIDE != 1
+    if (column % ADDITIVE_PERM_LINEAR_BOUND_STRIDE != 0) {
+        return true;
+    }
+#endif
+    for (direction = 0; direction < bounds->direction_count[row];
+         ++direction) {
+        unsigned first = bounds->direction_first[row][direction];
+        unsigned second = bounds->direction_second[row][direction];
+        int64_t current = (int64_t)bounds->tally[row][first] -
+                          (int64_t)bounds->tally[row][second];
+
+        if (current +
+                bounds->direction_minimum_left[row][column][direction] > 0 ||
+            current +
+                bounds->direction_maximum_left[row][column][direction] < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 static void add_additive_perm_choice(struct search *search, unsigned row,
                                      unsigned column, bool add)
 {
     struct additive_perm_bounds *bounds = &search->additive_permutations;
     unsigned actual_column;
-    unsigned face;
     unsigned permutation;
 
     if (row < 2U) {
         return;
     }
     actual_column = ordered_column(search, row, column);
-    face = search->grid[row][actual_column];
     for (permutation = 0;
          permutation < bounds->permutation_count[row]; ++permutation) {
-        uint64_t contribution = bounds->contribution[row][face][permutation];
-#if MIRROR
-        unsigned mirror_column = SIDES - actual_column - 1U;
-        unsigned mirror_face = search->grid[row][mirror_column];
-        contribution += bounds->contribution[row][mirror_face][permutation];
-#endif
+        uint64_t contribution = additive_perm_contribution_at(
+            search, bounds, row, row, actual_column, permutation);
         if (add) {
             bounds->tally[row][permutation] += contribution;
         } else {
@@ -1850,6 +2025,11 @@ static void publish_worker_stats(struct search *search)
     atomic_store_explicit(&search->published->additive_perm_prunes,
                           search->additive_perm_prunes,
                           memory_order_relaxed);
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    atomic_store_explicit(&search->published->linear_perm_prunes,
+                          search->linear_perm_prunes,
+                          memory_order_relaxed);
+#endif
 #endif
     atomic_store_explicit(&search->published->all_subset_place_prunes,
                           search->all_subset_place_prunes,
@@ -2114,6 +2294,12 @@ static void search_row(struct search *search, unsigned row, unsigned column)
         ++search->additive_perm_prunes;
         return;
     }
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    if (!additive_perm_direction_bounds_allow_goal(search, row, column)) {
+        ++search->linear_perm_prunes;
+        return;
+    }
+#endif
 #endif
 
     if (column == SEARCH_COLUMNS) {
@@ -2208,6 +2394,9 @@ struct totals {
     uint64_t prefix_place_prunes;
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     uint64_t additive_perm_prunes;
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    uint64_t linear_perm_prunes;
+#endif
 #endif
     uint64_t all_subset_place_prunes;
     uint64_t all_subset_place_fair_count;
@@ -2292,6 +2481,10 @@ static struct totals collect_totals(const struct worker *workers,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
         totals.additive_perm_prunes += atomic_load_explicit(
             &workers[i].stats.additive_perm_prunes, memory_order_relaxed);
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+        totals.linear_perm_prunes += atomic_load_explicit(
+            &workers[i].stats.linear_perm_prunes, memory_order_relaxed);
+#endif
 #endif
         totals.all_subset_place_prunes += atomic_load_explicit(
             &workers[i].stats.all_subset_place_prunes,
@@ -2438,6 +2631,9 @@ static void print_progress(const struct shared_state *shared,
     char permutation_fair[SI_COUNT_TEXT_SIZE];
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     char additive_perm_prunes[SI_COUNT_TEXT_SIZE];
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    char linear_perm_prunes[SI_COUNT_TEXT_SIZE];
+#endif
 #elif !PERM_ONLY
     uint64_t all_subset_total = atomic_load_explicit(
         &shared->all_subset_total, memory_order_relaxed);
@@ -2453,6 +2649,9 @@ static void print_progress(const struct shared_state *shared,
     format_si_count(permutation_fair, permutation_total);
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     format_si_count(additive_perm_prunes, totals.additive_perm_prunes);
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+    format_si_count(linear_perm_prunes, totals.linear_perm_prunes);
+#endif
 #elif !PERM_ONLY
     format_si_count(prefix_place_prunes, totals.prefix_place_prunes);
     format_si_count(all_subset_place_prunes,
@@ -2467,6 +2666,9 @@ static void print_progress(const struct shared_state *shared,
             " pair-bound-pruned=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             " additive-perm-pruned=%s"
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+            " linear-perm-pruned=%s"
+#endif
 #elif !PERM_ONLY
             " prefix-place-pruned=%s"
             " all-subset-place-pruned=%s"
@@ -2478,6 +2680,9 @@ static void print_progress(const struct shared_state *shared,
             linear_place_prunes, pair_bound_prunes,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             additive_perm_prunes,
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+            linear_perm_prunes,
+#endif
 #elif !PERM_ONLY
             prefix_place_prunes,
             all_subset_place_prunes,
@@ -2661,6 +2866,9 @@ int main(int argc, char **argv)
         atomic_init(&workers[i].stats.prefix_place_prunes, 0);
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
         atomic_init(&workers[i].stats.additive_perm_prunes, 0);
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+        atomic_init(&workers[i].stats.linear_perm_prunes, 0);
+#endif
 #endif
         atomic_init(&workers[i].stats.all_subset_place_prunes, 0);
         atomic_init(&workers[i].stats.all_subset_place_fair_count, 0);
@@ -2761,6 +2969,9 @@ int main(int argc, char **argv)
             char permutation_fair[SI_COUNT_TEXT_SIZE];
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             char additive_perm_prunes[SI_COUNT_TEXT_SIZE];
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+            char linear_perm_prunes[SI_COUNT_TEXT_SIZE];
+#endif
 #elif !PERM_ONLY
             uint64_t all_subset_total = atomic_load_explicit(
                 &shared.all_subset_total, memory_order_relaxed);
@@ -2779,6 +2990,10 @@ int main(int argc, char **argv)
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             format_si_count(additive_perm_prunes,
                             totals.additive_perm_prunes);
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+            format_si_count(linear_perm_prunes,
+                            totals.linear_perm_prunes);
+#endif
 #elif !PERM_ONLY
             format_si_count(prefix_place_prunes,
                             totals.prefix_place_prunes);
@@ -2812,6 +3027,9 @@ int main(int argc, char **argv)
                     ", pair-bound-prunes=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     ", additive-perm-prunes=%s"
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+                    ", linear-perm-prunes=%s"
+#endif
 #elif !PERM_ONLY
                     ", prefix-place-prunes=%s"
                     ", all-subset-place-prunes=%s"
@@ -2829,6 +3047,9 @@ int main(int argc, char **argv)
                     pair_bound_prunes,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     additive_perm_prunes,
+#if ADDITIVE_PERM_LINEAR_ACTIVE
+                    linear_perm_prunes,
+#endif
 #elif !PERM_ONLY
                     prefix_place_prunes,
                     all_subset_place_prunes,
