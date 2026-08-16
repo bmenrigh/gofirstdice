@@ -2661,9 +2661,9 @@ static void print_progress(const struct shared_state *shared,
 
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
-            " nodes=%s pruned=%s"
+            " nodes=%s place-pruned=%s"
             " linear-place-pruned=%s"
-            " pair-bound-pruned=%s"
+            " pair-pruned=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             " additive-perm-pruned=%s"
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -3022,9 +3022,9 @@ int main(int argc, char **argv)
 
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
-                    ", nodes=%s (%s/s), bound-prunes=%s"
+                    ", nodes=%s (%s/s), place-pruned=%s"
                     ", linear-place-prunes=%s"
-                    ", pair-bound-prunes=%s"
+                    ", pair-pruned=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     ", additive-perm-prunes=%s"
 #if ADDITIVE_PERM_LINEAR_ACTIVE
