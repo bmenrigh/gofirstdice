@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -44,6 +45,10 @@
 #define HIGH_FIRST 1
 #endif
 
+#ifndef PERM_ONLY
+#define PERM_ONLY 0
+#endif
+
 #if MIRROR != 0 && MIRROR != 1
 #error "MIRROR must be either 0 or 1"
 #endif
@@ -51,6 +56,12 @@
 #if HIGH_FIRST != 0 && HIGH_FIRST != 1
 #error "HIGH_FIRST must be either 0 or 1"
 #endif
+
+#if PERM_ONLY != 0 && PERM_ONLY != 1
+#error "PERM_ONLY must be either 0 or 1"
+#endif
+
+#define ADDITIVE_PERM_BOUNDS_ACTIVE (PERM_ONLY && DICE >= 4)
 
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
@@ -92,22 +103,27 @@
 /* Number of permutations and partial permutations, including the empty one. */
 #if DICE == 2
 #define DICE_FACTORIAL UINT64_C(2)
+#define MAX_PREFIX_PERMUTATIONS 1
 #define PERM_STATE_COUNT 5
 #define PERM_EDGE_COUNT 2
 #elif DICE == 3
 #define DICE_FACTORIAL UINT64_C(6)
+#define MAX_PREFIX_PERMUTATIONS 2
 #define PERM_STATE_COUNT 16
 #define PERM_EDGE_COUNT 5
 #elif DICE == 4
 #define DICE_FACTORIAL UINT64_C(24)
+#define MAX_PREFIX_PERMUTATIONS 6
 #define PERM_STATE_COUNT 65
 #define PERM_EDGE_COUNT 16
 #elif DICE == 5
 #define DICE_FACTORIAL UINT64_C(120)
+#define MAX_PREFIX_PERMUTATIONS 24
 #define PERM_STATE_COUNT 326
 #define PERM_EDGE_COUNT 65
 #elif DICE == 6
 #define DICE_FACTORIAL UINT64_C(720)
+#define MAX_PREFIX_PERMUTATIONS 120
 #define PERM_STATE_COUNT 1957
 #define PERM_EDGE_COUNT 326
 #else
@@ -126,9 +142,13 @@ _Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
 
 struct options {
     uint64_t limit;
+    uint64_t jobs;
+    uint64_t seed;
     uint64_t print_limit;
     uint64_t progress_seconds;
     unsigned threads;
+    bool random_order;
+    bool seed_given;
     bool quiet;
 };
 
@@ -150,6 +170,32 @@ struct perm_counter {
     size_t length_begin[DICE + 2];
 };
 
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+/*
+ * When row r is being built, dice [0,r) are fixed.  Each candidate face's
+ * contribution to every ordering of dice [0,r] is therefore independent of
+ * the other faces selected for row r and can be added and removed directly.
+ */
+struct additive_perm_bounds {
+    uint16_t prefix_state[DICE][MAX_PREFIX_PERMUTATIONS];
+    uint16_t reverse_suffix_state[DICE][MAX_PREFIX_PERMUTATIONS];
+    unsigned permutation_count[DICE];
+    uint64_t goal[DICE];
+
+    uint64_t contribution[DICE][FACE_COUNT][MAX_PREFIX_PERMUTATIONS];
+    uint64_t tally[DICE][MAX_PREFIX_PERMUTATIONS];
+    uint64_t minimum_left[DICE][SEARCH_COLUMNS + 1]
+                         [MAX_PREFIX_PERMUTATIONS];
+    uint64_t maximum_left[DICE][SEARCH_COLUMNS + 1]
+                         [MAX_PREFIX_PERMUTATIONS];
+
+    /* Reused only while one row's contribution table is constructed. */
+    uint64_t above[FACE_COUNT][MAX_PREFIX_PERMUTATIONS];
+    uint64_t lower_ways[PERM_STATE_COUNT];
+    uint64_t reverse_ways[PERM_STATE_COUNT];
+};
+#endif
+
 struct shared_state;
 struct worker_stats;
 
@@ -157,6 +203,9 @@ struct search {
     /* Face labels are zero based internally. */
     unsigned grid[DICE][SIDES];
     unsigned owner[FACE_COUNT];
+
+    /* Recursion-depth to physical-column mapping, planned once per row. */
+    unsigned column_order[DICE][SEARCH_COLUMNS];
 
     /* contribution[face][place], where place zero is the highest roll. */
     uint64_t contribution[FACE_COUNT][DICE];
@@ -185,6 +234,9 @@ struct search {
     bool linear_place_bounds_possible;
 
     struct perm_counter permutations;
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    struct additive_perm_bounds additive_permutations;
+#endif
     struct shared_state *shared;
     struct worker_stats *published;
 
@@ -192,8 +244,10 @@ struct search {
     uint64_t bound_prunes;
     uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
-    uint64_t pair_prunes;
     uint64_t prefix_place_prunes;
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    uint64_t additive_perm_prunes;
+#endif
     uint64_t all_subset_place_prunes;
     uint64_t all_subset_place_fair_count;
     uint64_t permutation_fair_count;
@@ -204,8 +258,10 @@ struct worker_stats {
     atomic_uint_fast64_t bound_prunes;
     atomic_uint_fast64_t linear_place_prunes;
     atomic_uint_fast64_t pair_bound_prunes;
-    atomic_uint_fast64_t pair_prunes;
     atomic_uint_fast64_t prefix_place_prunes;
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    atomic_uint_fast64_t additive_perm_prunes;
+#endif
     atomic_uint_fast64_t all_subset_place_prunes;
     atomic_uint_fast64_t all_subset_place_fair_count;
     atomic_uint_fast64_t permutation_fair_count;
@@ -227,6 +283,8 @@ struct shared_state {
     unsigned thread_count;
     unsigned split_depth;
     uint64_t job_count;
+    uint64_t prefix_count;
+    uint64_t *job_order;
 
     atomic_uint_fast64_t next_job;
     atomic_uint_fast64_t jobs_done;
@@ -256,6 +314,40 @@ struct worker {
     struct search search;
 };
 
+static volatile sig_atomic_t sigint_requested;
+
+static void request_sigint_stop(int signal_number)
+{
+    (void)signal_number;
+    sigint_requested = 1;
+}
+
+static bool install_sigint_handler(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = request_sigint_stop;
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(SIGINT, &action, NULL) != 0) {
+        fprintf(stderr, "Unable to install Ctrl-C handler: %s\n",
+                strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static const char *traversal_description(void)
+{
+#if MIRROR
+    return "fail-first; outer-pair ties first";
+#elif HIGH_FIRST
+    return "fail-first; high-label ties first";
+#else
+    return "fail-first; low-label ties first";
+#endif
+}
+
 static void usage(FILE *stream, const char *program)
 {
     fprintf(stream,
@@ -264,14 +356,31 @@ static void usage(FILE *stream, const char *program)
             "Search the compile-time-selected %s%dd%d column-grouped space.\n"
             "The first searched column is fixed to remove equivalent die "
             "renamings.\n"
+#if PERM_ONLY
+            "This build searches only for permutation-fair results and uses "
+            "incremental prefix-permutation bounds.\n"
+#else
             "Results are place-fair for every subset. Fully permutation-fair "
             "results are reported only in the stronger class.\n"
+#endif
             "\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
+            "  -j, --jobs N        logical jobs; default is chosen automatically\n"
+            "      --random-order shuffle jobs before starting workers\n"
+            "      --seed N        random-order seed; requires --random-order\n"
+#if PERM_ONLY
+            "  -n, --limit N       stop after N permutation-fair results\n"
+#else
             "  -n, --limit N       stop after N reported results\n"
+#endif
             "  -p, --progress N    progress interval in seconds; 0 disables\n"
+#if PERM_ONLY
+            "      --print-limit N print at most N solutions\n"
+            "      --all-solutions print every solution\n"
+#else
             "      --print-limit N print at most N of each solution class\n"
             "      --all-solutions print every solution in both classes\n"
+#endif
             "  -q, --quiet         print only startup and final counts\n"
             "  -h, --help          show this help\n",
             program, MIRROR ? "mirrored " : "", DICE, SIDES);
@@ -326,6 +435,26 @@ static bool parse_options(int argc, char **argv, struct options *options)
             options->threads = (unsigned)threads;
             continue;
         }
+        if (strcmp(argv[i], "-j") == 0 || strcmp(argv[i], "--jobs") == 0) {
+            if (++i >= argc || !parse_uint64(argv[i], &options->jobs) ||
+                options->jobs == 0) {
+                fprintf(stderr, "Job count must be positive.\n");
+                return false;
+            }
+            continue;
+        }
+        if (strcmp(argv[i], "--random-order") == 0) {
+            options->random_order = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--seed") == 0) {
+            if (++i >= argc || !parse_uint64(argv[i], &options->seed)) {
+                fprintf(stderr, "Invalid random-order seed.\n");
+                return false;
+            }
+            options->seed_given = true;
+            continue;
+        }
         if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--limit") == 0) {
             if (++i >= argc || !parse_uint64(argv[i], &options->limit)) {
                 fprintf(stderr, "Invalid solution limit.\n");
@@ -354,6 +483,78 @@ static bool parse_options(int argc, char **argv, struct options *options)
     if (options->quiet) {
         options->print_limit = 0;
         options->progress_seconds = 0;
+    }
+    if (options->seed_given && !options->random_order) {
+        fprintf(stderr, "--seed requires --random-order.\n");
+        return false;
+    }
+    return true;
+}
+
+static uint64_t default_random_seed(void)
+{
+    struct timespec realtime = {0};
+    struct timespec monotonic = {0};
+    uint64_t seed;
+
+    (void)clock_gettime(CLOCK_REALTIME, &realtime);
+    (void)clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    seed = (uint64_t)realtime.tv_sec ^
+        ((uint64_t)realtime.tv_nsec << 32U) ^
+        (uint64_t)monotonic.tv_nsec ^ (uint64_t)getpid();
+    return seed;
+}
+
+/* SplitMix64 is small, fast, and sufficient for shuffling independent jobs. */
+static uint64_t next_job_random(uint64_t *state)
+{
+    uint64_t value = (*state += UINT64_C(0x9e3779b97f4a7c15));
+
+    value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    return value ^ (value >> 31U);
+}
+
+static uint64_t random_below(uint64_t *state, uint64_t bound)
+{
+    uint64_t threshold = (UINT64_C(0) - bound) % bound;
+    uint64_t value;
+
+    do {
+        value = next_job_random(state);
+    } while (value < threshold);
+    return value % bound;
+}
+
+static bool initialize_job_order(struct shared_state *shared)
+{
+    uint64_t state;
+    uint64_t i;
+
+    if (!shared->options.random_order) {
+        return true;
+    }
+    if (shared->job_count > SIZE_MAX / sizeof(*shared->job_order)) {
+        fprintf(stderr, "Random job-order table is too large to allocate.\n");
+        return false;
+    }
+    shared->job_order = malloc(
+        (size_t)shared->job_count * sizeof(*shared->job_order));
+    if (shared->job_order == NULL) {
+        fprintf(stderr, "Unable to allocate random job-order table.\n");
+        return false;
+    }
+    for (i = 0; i < shared->job_count; ++i) {
+        shared->job_order[i] = i;
+    }
+
+    state = shared->options.seed;
+    for (i = shared->job_count; i > 1U; --i) {
+        uint64_t selected = random_below(&state, i);
+        uint64_t temporary = shared->job_order[i - 1U];
+
+        shared->job_order[i - 1U] = shared->job_order[selected];
+        shared->job_order[selected] = temporary;
     }
     return true;
 }
@@ -612,6 +813,7 @@ static bool counted_subset_is_permutation_fair(
     return true;
 }
 
+#if !PERM_ONLY
 static unsigned mask_size(unsigned mask)
 {
     unsigned size = 0;
@@ -684,6 +886,7 @@ static bool counted_all_subsets_are_place_fair(const struct search *search)
     }
     return true;
 }
+#endif
 
 static void initialize_grid(struct search *search)
 {
@@ -724,6 +927,263 @@ static unsigned physical_column(unsigned search_column)
 #endif
 }
 
+static unsigned ordered_column(const struct search *search, unsigned row,
+                               unsigned search_column)
+{
+    return search->column_order[row][search_column];
+}
+
+static void reset_column_order(struct search *search, unsigned row)
+{
+    unsigned column;
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        search->column_order[row][column] = physical_column(column);
+    }
+}
+
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+static void add_owner_to_perm_ways(const struct perm_counter *counter,
+                                   uint64_t ways[PERM_STATE_COUNT],
+                                   unsigned owner)
+{
+    size_t edge;
+
+    for (edge = 0; edge < PERM_EDGE_COUNT; ++edge) {
+        const struct perm_edge *transition = &counter->edge[owner][edge];
+        ways[transition->destination] += ways[transition->source];
+    }
+}
+
+static bool initialize_additive_perm_bounds(struct search *search)
+{
+    struct additive_perm_bounds *bounds = &search->additive_permutations;
+    const struct perm_counter *counter = &search->permutations;
+    unsigned row;
+
+    for (row = 2; row + 1U < DICE; ++row) {
+        unsigned dice_built = row + 1U;
+        unsigned prefix_mask = (1U << dice_built) - 1U;
+        uint64_t outcomes;
+        uint64_t factorial = 1;
+        size_t state;
+        unsigned permutation = 0;
+        unsigned i;
+
+        for (i = 2; i <= dice_built; ++i) {
+            factorial *= i;
+        }
+        if (!integer_power(SIDES, dice_built, &outcomes) ||
+            outcomes % factorial != 0) {
+            search->permutation_fairness_possible = false;
+        } else {
+            bounds->goal[row] = outcomes / factorial;
+        }
+
+        for (state = counter->length_begin[dice_built];
+             state < counter->length_begin[dice_built + 1U]; ++state) {
+            const struct perm_state *full = &counter->state[state];
+            uint64_t prefix_key = 0;
+            uint64_t reverse_suffix_key = 0;
+            unsigned position;
+            unsigned new_die_position = dice_built;
+            unsigned prefix_length = 0;
+            unsigned suffix_length = 0;
+            int prefix_state;
+            int suffix_state;
+
+            if (full->mask != prefix_mask) {
+                continue;
+            }
+            if (permutation >= MAX_PREFIX_PERMUTATIONS) {
+                return false;
+            }
+            for (position = 0; position < dice_built; ++position) {
+                unsigned die = (unsigned)(
+                    (full->key >> (4U * position)) & UINT64_C(0xf)) - 1U;
+
+                if (die == row) {
+                    new_die_position = position;
+                    break;
+                }
+                prefix_key |= (uint64_t)(die + 1U) << (4U * prefix_length);
+                ++prefix_length;
+            }
+            if (new_die_position == dice_built) {
+                return false;
+            }
+            position = dice_built;
+            while (position-- > new_die_position + 1U) {
+                unsigned die = (unsigned)(
+                    (full->key >> (4U * position)) & UINT64_C(0xf)) - 1U;
+                reverse_suffix_key |=
+                    (uint64_t)(die + 1U) << (4U * suffix_length);
+                ++suffix_length;
+            }
+            prefix_state = find_perm_state(counter, prefix_length, prefix_key);
+            suffix_state = find_perm_state(
+                counter, suffix_length, reverse_suffix_key);
+            if (prefix_state < 0 || suffix_state < 0) {
+                return false;
+            }
+            bounds->prefix_state[row][permutation] =
+                (uint16_t)prefix_state;
+            bounds->reverse_suffix_state[row][permutation] =
+                (uint16_t)suffix_state;
+            ++permutation;
+        }
+        if (permutation != factorial) {
+            return false;
+        }
+        bounds->permutation_count[row] = permutation;
+    }
+    return true;
+}
+
+static uint64_t saturating_add(uint64_t first, uint64_t second)
+{
+    return UINT64_MAX - first < second ? UINT64_MAX : first + second;
+}
+
+static void build_additive_perm_bounds(struct search *search, unsigned row)
+{
+    struct additive_perm_bounds *bounds = &search->additive_permutations;
+    const struct perm_counter *counter = &search->permutations;
+    unsigned permutation_count = bounds->permutation_count[row];
+    unsigned face;
+    unsigned permutation;
+    unsigned column;
+
+    build_owner_table(search);
+    memset(bounds->reverse_ways, 0, sizeof(bounds->reverse_ways));
+    bounds->reverse_ways[0] = 1;
+    face = FACE_COUNT;
+    while (face-- > 0) {
+        for (permutation = 0; permutation < permutation_count;
+             ++permutation) {
+            bounds->above[face][permutation] = bounds->reverse_ways[
+                bounds->reverse_suffix_state[row][permutation]];
+        }
+        if (search->owner[face] < row) {
+            add_owner_to_perm_ways(
+                counter, bounds->reverse_ways, search->owner[face]);
+        }
+    }
+
+    memset(bounds->lower_ways, 0, sizeof(bounds->lower_ways));
+    bounds->lower_ways[0] = 1;
+    for (face = 0; face < FACE_COUNT; ++face) {
+        for (permutation = 0; permutation < permutation_count;
+             ++permutation) {
+            uint64_t below = bounds->lower_ways[
+                bounds->prefix_state[row][permutation]];
+            uint64_t above = bounds->above[face][permutation];
+
+            bounds->contribution[row][face][permutation] = below * above;
+        }
+        if (search->owner[face] < row) {
+            add_owner_to_perm_ways(
+                counter, bounds->lower_ways, search->owner[face]);
+        }
+    }
+
+    memset(bounds->tally[row], 0, sizeof(bounds->tally[row]));
+    memset(bounds->minimum_left[row][SEARCH_COLUMNS], 0,
+           sizeof(bounds->minimum_left[row][SEARCH_COLUMNS]));
+    memset(bounds->maximum_left[row][SEARCH_COLUMNS], 0,
+           sizeof(bounds->maximum_left[row][SEARCH_COLUMNS]));
+    column = SEARCH_COLUMNS;
+    while (column-- > 0) {
+        unsigned actual_column = ordered_column(search, row, column);
+
+        for (permutation = 0; permutation < permutation_count;
+             ++permutation) {
+            uint64_t minimum = UINT64_MAX;
+            uint64_t maximum = 0;
+            unsigned candidate;
+
+            for (candidate = row; candidate < DICE; ++candidate) {
+                unsigned candidate_face =
+                    search->grid[candidate][actual_column];
+                uint64_t contribution =
+                    bounds->contribution[row][candidate_face][permutation];
+#if MIRROR
+                unsigned mirror_column = SIDES - actual_column - 1U;
+                unsigned mirror_face =
+                    search->grid[candidate][mirror_column];
+                contribution +=
+                    bounds->contribution[row][mirror_face][permutation];
+#endif
+                if (contribution < minimum) {
+                    minimum = contribution;
+                }
+                if (contribution > maximum) {
+                    maximum = contribution;
+                }
+            }
+            bounds->minimum_left[row][column][permutation] = saturating_add(
+                minimum, bounds->minimum_left[row][column + 1U][permutation]);
+            bounds->maximum_left[row][column][permutation] = saturating_add(
+                maximum, bounds->maximum_left[row][column + 1U][permutation]);
+        }
+    }
+}
+
+static bool additive_perm_bounds_allow_goal(const struct search *search,
+                                            unsigned row, unsigned column)
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    unsigned permutation;
+
+    if (row < 2U) {
+        return true;
+    }
+    for (permutation = 0;
+         permutation < bounds->permutation_count[row]; ++permutation) {
+        uint64_t current = bounds->tally[row][permutation];
+        uint64_t goal = bounds->goal[row];
+
+        if (current > goal ||
+            bounds->minimum_left[row][column][permutation] > goal - current ||
+            bounds->maximum_left[row][column][permutation] < goal - current) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void add_additive_perm_choice(struct search *search, unsigned row,
+                                     unsigned column, bool add)
+{
+    struct additive_perm_bounds *bounds = &search->additive_permutations;
+    unsigned actual_column;
+    unsigned face;
+    unsigned permutation;
+
+    if (row < 2U) {
+        return;
+    }
+    actual_column = ordered_column(search, row, column);
+    face = search->grid[row][actual_column];
+    for (permutation = 0;
+         permutation < bounds->permutation_count[row]; ++permutation) {
+        uint64_t contribution = bounds->contribution[row][face][permutation];
+#if MIRROR
+        unsigned mirror_column = SIDES - actual_column - 1U;
+        unsigned mirror_face = search->grid[row][mirror_column];
+        contribution += bounds->contribution[row][mirror_face][permutation];
+#endif
+        if (add) {
+            bounds->tally[row][permutation] += contribution;
+        } else {
+            bounds->tally[row][permutation] -= contribution;
+        }
+    }
+}
+
+#endif
+
 #if !MIRROR
 static bool pair_tracking_active(unsigned column)
 {
@@ -736,11 +1196,11 @@ static bool pair_tracking_active(unsigned column)
 }
 #endif
 
-static uint64_t choice_contribution(const struct search *search,
-                                    unsigned candidate, unsigned column,
-                                    unsigned place)
+static uint64_t choice_contribution_at(const struct search *search,
+                                       unsigned candidate,
+                                       unsigned actual_column,
+                                       unsigned place)
 {
-    unsigned actual_column = physical_column(column);
     unsigned face = search->grid[candidate][actual_column];
     uint64_t contribution = search->contribution[face][place];
 
@@ -750,6 +1210,247 @@ static uint64_t choice_contribution(const struct search *search,
     contribution += search->contribution[mirror_face][place];
 #endif
     return contribution;
+}
+
+static uint64_t choice_contribution(const struct search *search,
+                                    unsigned row, unsigned candidate,
+                                    unsigned column, unsigned place)
+{
+    return choice_contribution_at(
+        search, candidate, ordered_column(search, row, column), place);
+}
+
+/*
+ * Column zero stays fixed to remove equivalent die renamings.  The remaining
+ * columns are stably sorted by the number of choices that can still satisfy
+ * the place, linear-place, and pairwise bounds.  The smallest surviving domain
+ * is tried first, while ties retain the useful HIGH_FIRST/LOW_FIRST bias.
+ * This lookahead is performed only when the row configuration is entered;
+ * recursive nodes do no ordering work.
+ */
+static void plan_column_order(struct search *search, unsigned row)
+{
+    uint64_t minimum[SEARCH_COLUMNS][DICE];
+    uint64_t maximum[SEARCH_COLUMNS][DICE];
+    uint64_t total_minimum[DICE] = {0};
+    uint64_t total_maximum[DICE] = {0};
+    int64_t direction_minimum[SEARCH_COLUMNS][PLACE_DIRECTION_COUNT];
+    int64_t direction_maximum[SEARCH_COLUMNS][PLACE_DIRECTION_COUNT];
+    int64_t direction_total_minimum[PLACE_DIRECTION_COUNT] = {0};
+    int64_t direction_total_maximum[PLACE_DIRECTION_COUNT] = {0};
+#if !MIRROR
+    unsigned pair_minimum[SEARCH_COLUMNS][DICE];
+    unsigned pair_maximum[SEARCH_COLUMNS][DICE];
+    unsigned pair_total_minimum[DICE] = {0};
+    unsigned pair_total_maximum[DICE] = {0};
+#endif
+    unsigned feasible_choices[SEARCH_COLUMNS];
+    unsigned column;
+    unsigned place;
+
+    reset_column_order(search, row);
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = search->column_order[row][column];
+        unsigned candidate_limit = column == 0 ? row + 1U : DICE;
+
+        for (place = 0; place < DICE; ++place) {
+            uint64_t low = UINT64_MAX;
+            uint64_t high = 0;
+            unsigned candidate;
+
+            for (candidate = row; candidate < candidate_limit; ++candidate) {
+                uint64_t value = choice_contribution_at(
+                    search, candidate, actual_column, place);
+
+                if (value < low) {
+                    low = value;
+                }
+                if (value > high) {
+                    high = value;
+                }
+            }
+            minimum[column][place] = low;
+            maximum[column][place] = high;
+            total_minimum[place] += low;
+            total_maximum[place] += high;
+        }
+    }
+
+    if (search->linear_place_bounds_possible) {
+        unsigned first;
+        unsigned direction = 0;
+
+        for (first = 0; first < DICE; ++first) {
+            unsigned second;
+
+            for (second = first + 1U; second < DICE; ++second) {
+                for (column = 0; column < SEARCH_COLUMNS; ++column) {
+                    unsigned actual_column =
+                        search->column_order[row][column];
+                    unsigned candidate_limit =
+                        column == 0 ? row + 1U : DICE;
+                    unsigned candidate = row;
+                    int64_t low =
+                        (int64_t)choice_contribution_at(
+                            search, candidate, actual_column, first) -
+                        (int64_t)choice_contribution_at(
+                            search, candidate, actual_column, second);
+                    int64_t high = low;
+
+                    for (++candidate; candidate < candidate_limit;
+                         ++candidate) {
+                        int64_t value = (int64_t)choice_contribution_at(
+                            search, candidate, actual_column, first) -
+                            (int64_t)choice_contribution_at(
+                                search, candidate, actual_column, second);
+
+                        if (value < low) {
+                            low = value;
+                        }
+                        if (value > high) {
+                            high = value;
+                        }
+                    }
+                    direction_minimum[column][direction] = low;
+                    direction_maximum[column][direction] = high;
+                    direction_total_minimum[direction] += low;
+                    direction_total_maximum[direction] += high;
+                }
+                ++direction;
+            }
+        }
+    }
+
+#if !MIRROR
+    {
+        unsigned previous;
+
+        for (previous = 0; previous < row; ++previous) {
+            for (column = 0; column < SEARCH_COLUMNS; ++column) {
+                unsigned actual_column =
+                    search->column_order[row][column];
+                unsigned candidate_limit =
+                    column == 0 ? row + 1U : DICE;
+                unsigned low = 1;
+                unsigned high = 0;
+                unsigned candidate;
+
+                for (candidate = row; candidate < candidate_limit;
+                     ++candidate) {
+                    unsigned value =
+                        search->grid[candidate][actual_column] >
+                        search->grid[previous][actual_column];
+
+                    if (value < low) {
+                        low = value;
+                    }
+                    if (value > high) {
+                        high = value;
+                    }
+                }
+                pair_minimum[column][previous] = low;
+                pair_maximum[column][previous] = high;
+                pair_total_minimum[previous] += low;
+                pair_total_maximum[previous] += high;
+            }
+        }
+    }
+#endif
+
+    feasible_choices[0] = 1;
+    for (column = 1; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = search->column_order[row][column];
+        unsigned feasible = 0;
+        unsigned candidate;
+
+        for (candidate = row; candidate < DICE; ++candidate) {
+            bool allowed = true;
+
+            for (place = 0; place < DICE; ++place) {
+                uint64_t value = choice_contribution_at(
+                    search, candidate, actual_column, place);
+                uint64_t low = total_minimum[place] -
+                    minimum[column][place];
+                uint64_t high = total_maximum[place] -
+                    maximum[column][place];
+
+                if (value > search->place_goal ||
+                    low > search->place_goal - value ||
+                    high < search->place_goal - value) {
+                    allowed = false;
+                    break;
+                }
+            }
+            if (allowed && search->linear_place_bounds_possible) {
+                unsigned first;
+                unsigned direction = 0;
+
+                for (first = 0; first < DICE && allowed; ++first) {
+                    unsigned second;
+
+                    for (second = first + 1U; second < DICE; ++second) {
+                        int64_t value =
+                            (int64_t)choice_contribution_at(
+                                search, candidate, actual_column, first) -
+                            (int64_t)choice_contribution_at(
+                                search, candidate, actual_column, second);
+                        int64_t needed = -value;
+                        int64_t low = direction_total_minimum[direction] -
+                            direction_minimum[column][direction];
+                        int64_t high = direction_total_maximum[direction] -
+                            direction_maximum[column][direction];
+
+                        if (low > needed || high < needed) {
+                            allowed = false;
+                            break;
+                        }
+                        ++direction;
+                    }
+                }
+            }
+#if !MIRROR
+            if (allowed) {
+                unsigned previous;
+
+                for (previous = 0; previous < row; ++previous) {
+                    unsigned value =
+                        search->grid[candidate][actual_column] >
+                        search->grid[previous][actual_column];
+                    unsigned low = pair_total_minimum[previous] -
+                        pair_minimum[column][previous];
+                    unsigned high = pair_total_maximum[previous] -
+                        pair_maximum[column][previous];
+
+                    if (value + low > SIDES / 2U ||
+                        value + high < SIDES / 2U) {
+                        allowed = false;
+                        break;
+                    }
+                }
+            }
+#endif
+            if (allowed) {
+                ++feasible;
+            }
+        }
+        feasible_choices[column] = feasible;
+    }
+
+    for (column = 2; column < SEARCH_COLUMNS; ++column) {
+        unsigned selected_column = search->column_order[row][column];
+        unsigned selected_choices = feasible_choices[column];
+        unsigned position = column;
+
+        while (position > 1U &&
+               feasible_choices[position - 1U] > selected_choices) {
+            search->column_order[row][position] =
+                search->column_order[row][position - 1U];
+            feasible_choices[position] = feasible_choices[position - 1U];
+            --position;
+        }
+        search->column_order[row][position] = selected_column;
+        feasible_choices[position] = selected_choices;
+    }
 }
 
 /* Build independent min/max suffix bounds for one die being filled. */
@@ -770,7 +1471,7 @@ static void build_bounds(struct search *search, unsigned row)
 
             for (candidate = row; candidate < candidate_limit; ++candidate) {
                 uint64_t value = choice_contribution(
-                    search, candidate, (unsigned)column, place);
+                    search, row, candidate, (unsigned)column, place);
                 if (value < minimum) {
                     minimum = value;
                 }
@@ -809,9 +1510,10 @@ static void build_bounds(struct search *search, unsigned row)
                     for (candidate = row; candidate < candidate_limit;
                          ++candidate) {
                         int64_t value = (int64_t)choice_contribution(
-                            search, candidate, (unsigned)column, first) -
+                            search, row, candidate, (unsigned)column, first) -
                             (int64_t)choice_contribution(
-                                search, candidate, (unsigned)column, second);
+                                search, row, candidate, (unsigned)column,
+                                second);
 
                         if (value < minimum) {
                             minimum = value;
@@ -844,7 +1546,8 @@ static void build_bounds(struct search *search, unsigned row)
         search->pair_minimum_left[row][SEARCH_COLUMNS] = 0;
         search->pair_maximum_left[row][SEARCH_COLUMNS] = 0;
         for (column = SEARCH_COLUMNS - 1; column >= 0; --column) {
-            unsigned actual_column = physical_column((unsigned)column);
+            unsigned actual_column = ordered_column(
+                search, row, (unsigned)column);
             unsigned candidate_limit = column == 0 ? row + 1U : DICE;
             uint64_t any_wins = 0;
             uint64_t all_win = lane_ones;
@@ -1005,7 +1708,7 @@ static void initialize_pair_wins(struct search *search, unsigned row,
         unsigned column;
 
         for (column = 0; column < assigned_columns; ++column) {
-            unsigned actual_column = physical_column(column);
+            unsigned actual_column = ordered_column(search, row, column);
             if (search->grid[row][actual_column] >
                 search->grid[previous][actual_column]) {
                 ++wins;
@@ -1044,41 +1747,10 @@ static bool configuration_is_place_fair(const struct search *search)
 }
 
 /*
- * Off-diagonal column matchups balance automatically: each die wins once for
- * every ordered pair of unequal columns.  The pair is fair exactly when this
- * die wins half of the SIDES same-column matchups.
- */
-static bool die_is_pairwise_fair(const struct search *search, unsigned die)
-{
-#if MIRROR
-    /* Complementary faces on the same die make every pair fair. */
-    (void)search;
-    (void)die;
-    return true;
-#else
-    unsigned previous;
-
-    for (previous = 0; previous < die; ++previous) {
-        unsigned wins = 0;
-        unsigned column;
-
-        for (column = 0; column < SIDES; ++column) {
-            if (search->grid[die][column] > search->grid[previous][column]) {
-                ++wins;
-            }
-        }
-        if (wins * 2U != SIDES) {
-            return false;
-        }
-    }
-    return true;
-#endif
-}
-
-/*
  * Every completed prefix is one of the subsets that must be place-fair.
  * Count its ranks directly by scanning labels from low to high.
  */
+#if !PERM_ONLY
 static bool completed_prefix_is_place_fair(const struct search *search,
                                            unsigned dice_built)
 {
@@ -1146,6 +1818,7 @@ static bool completed_prefix_is_place_fair(const struct search *search,
     }
     return true;
 }
+#endif
 
 static double monotonic_seconds(void)
 {
@@ -1170,11 +1843,14 @@ static void publish_worker_stats(struct search *search)
     atomic_store_explicit(&search->published->pair_bound_prunes,
                           search->pair_bound_prunes,
                           memory_order_relaxed);
-    atomic_store_explicit(&search->published->pair_prunes,
-                          search->pair_prunes, memory_order_relaxed);
     atomic_store_explicit(&search->published->prefix_place_prunes,
                           search->prefix_place_prunes,
                           memory_order_relaxed);
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    atomic_store_explicit(&search->published->additive_perm_prunes,
+                          search->additive_perm_prunes,
+                          memory_order_relaxed);
+#endif
     atomic_store_explicit(&search->published->all_subset_place_prunes,
                           search->all_subset_place_prunes,
                           memory_order_relaxed);
@@ -1243,6 +1919,14 @@ static void accept_configuration(struct search *search)
 
     build_owner_table(search);
     count_permutation_ways(search, (1U << DICE) - 1U);
+#if PERM_ONLY
+    permutation_fair = search->permutation_fairness_possible &&
+        counted_subset_is_permutation_fair(
+            search, (1U << DICE) - 1U, DICE);
+    if (!permutation_fair) {
+        return;
+    }
+#else
     if (!counted_all_subsets_are_place_fair(search)) {
         ++search->all_subset_place_prunes;
         return;
@@ -1251,6 +1935,7 @@ static void accept_configuration(struct search *search)
     permutation_fair = search->permutation_fairness_possible &&
         counted_subset_is_permutation_fair(
             search, (1U << DICE) - 1U, DICE);
+#endif
 
     if (shared->options.limit != 0) {
         limit_claim = atomic_fetch_add_explicit(&shared->limit_claims, 1,
@@ -1261,6 +1946,10 @@ static void accept_configuration(struct search *search)
         }
     }
 
+#if PERM_ONLY
+    ++search->permutation_fair_count;
+    record_solution(search, PERMUTATION_FAIR);
+#else
     if (permutation_fair) {
         ++search->permutation_fair_count;
         record_solution(search, PERMUTATION_FAIR);
@@ -1268,6 +1957,7 @@ static void accept_configuration(struct search *search)
         ++search->all_subset_place_fair_count;
         record_solution(search, ALL_SUBSET_PLACE_FAIR);
     }
+#endif
 
     if (shared->options.limit != 0 &&
         limit_claim + 1U >= shared->options.limit) {
@@ -1278,7 +1968,7 @@ static void accept_configuration(struct search *search)
 static void apply_choice(struct search *search, unsigned row,
                          unsigned column, unsigned candidate)
 {
-    unsigned actual_column = physical_column(column);
+    unsigned actual_column = ordered_column(search, row, column);
     unsigned temporary = search->grid[row][actual_column];
     unsigned chosen_face;
     unsigned place;
@@ -1318,15 +2008,18 @@ static void apply_choice(struct search *search, unsigned row,
         search->tally[row][place] += search->contribution[chosen_face][place];
 #if MIRROR
         search->tally[row][place] += search->contribution[
-            search->grid[row][SIDES - column - 1U]][place];
+            search->grid[row][SIDES - actual_column - 1U]][place];
 #endif
     }
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    add_additive_perm_choice(search, row, column, true);
+#endif
 }
 
 static void undo_choice(struct search *search, unsigned row,
                         unsigned column, unsigned candidate)
 {
-    unsigned actual_column = physical_column(column);
+    unsigned actual_column = ordered_column(search, row, column);
     unsigned chosen_face = search->grid[row][actual_column];
     unsigned place;
     unsigned temporary;
@@ -1352,9 +2045,12 @@ static void undo_choice(struct search *search, unsigned row,
         search->tally[row][place] -= search->contribution[chosen_face][place];
 #if MIRROR
         search->tally[row][place] -= search->contribution[
-            search->grid[row][SIDES - column - 1U]][place];
+            search->grid[row][SIDES - actual_column - 1U]][place];
 #endif
     }
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    add_additive_perm_choice(search, row, column, false);
+#endif
 
     temporary = search->grid[row][actual_column];
     search->grid[row][actual_column] = search->grid[candidate][actual_column];
@@ -1371,10 +2067,9 @@ static void undo_choice(struct search *search, unsigned row,
 }
 
 /*
- * Fill one die from left to right.  Each branch swaps one face into place,
- * adds its contribution, recurses, then subtracts and swaps back.  In mirror
- * mode the complementary face and column are swapped and tallied with it.
- * There are no configuration or tally copies anywhere in the recursion.
+ * Fill one die in its planned column order.  Each branch swaps one face into
+ * place, recurses, then restores that swap and its additive tallies.  There
+ * are no configuration or tally copies anywhere in the recursion.
  *
  * Once DICE-1 dice meet the goal, the remaining die is forced and place-fair:
  * the totals over all dice are fixed.  accept_configuration verifies this.
@@ -1382,7 +2077,6 @@ static void undo_choice(struct search *search, unsigned row,
 static void search_row(struct search *search, unsigned row, unsigned column)
 {
     unsigned candidate;
-
     if (atomic_load_explicit(&search->shared->stop, memory_order_relaxed)) {
         return;
     }
@@ -1392,6 +2086,7 @@ static void search_row(struct search *search, unsigned row, unsigned column)
     }
 
     if (column == 0) {
+        plan_column_order(search, row);
         build_bounds(search, row);
     }
 #if !MIRROR
@@ -1411,6 +2106,15 @@ static void search_row(struct search *search, unsigned row, unsigned column)
         ++search->pair_bound_prunes;
         return;
     }
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    if (column == 0 && row >= 2U) {
+        build_additive_perm_bounds(search, row);
+    }
+    if (!additive_perm_bounds_allow_goal(search, row, column)) {
+        ++search->additive_perm_prunes;
+        return;
+    }
+#endif
 
     if (column == SEARCH_COLUMNS) {
         unsigned place;
@@ -1419,13 +2123,7 @@ static void search_row(struct search *search, unsigned row, unsigned column)
                 return;
             }
         }
-#if !MIRROR && ((SIDES % 2) != 0)
-        /* Odd sides cannot split the same-column wins exactly in half. */
-        if (!die_is_pairwise_fair(search, row)) {
-            ++search->pair_prunes;
-            return;
-        }
-#endif
+#if !PERM_ONLY
         if (row + 1U >= 3U) {
             build_owner_table(search);
         }
@@ -1433,29 +2131,38 @@ static void search_row(struct search *search, unsigned row, unsigned column)
             ++search->prefix_place_prunes;
             return;
         }
+#endif
         if (row + 1U < DICE - 1U) {
             search_row(search, row + 1U, 0);
         } else {
-            /* The last die is forced rather than visited by search_row(). */
-            if (!die_is_pairwise_fair(search, DICE - 1U)) {
-                ++search->pair_prunes;
-                return;
-            }
+            /*
+             * The last die is forced rather than visited by search_row().
+             * Pair bounds certified every pair among the built dice.  Once
+             * full place fairness is verified, expected-rank balance forces
+             * every remaining matchup with the last die to balance as well.
+             */
             accept_configuration(search);
         }
         return;
     }
 
-    /* Fixing column zero removes the DICE! equivalent die renamings. */
-    for (candidate = row; candidate < DICE; ++candidate) {
+    /* Give the compiler a separate, provably self-swapping first branch. */
+    apply_choice(search, row, column, row);
+    search_row(search, row, column + 1U);
+    undo_choice(search, row, column, row);
+    if (column == 0 ||
+        atomic_load_explicit(&search->shared->stop, memory_order_relaxed)) {
+        return;
+    }
+
+    for (candidate = row + 1U; candidate < DICE; ++candidate) {
         apply_choice(search, row, column, candidate);
         search_row(search, row, column + 1U);
         undo_choice(search, row, column, candidate);
 
-        if (column == 0 ||
-            atomic_load_explicit(&search->shared->stop,
+        if (atomic_load_explicit(&search->shared->stop,
                                  memory_order_relaxed)) {
-            break;
+            return;
         }
     }
 }
@@ -1479,10 +2186,17 @@ static bool initialize_search(struct search *search)
         fprintf(stderr, "Place contributions overflowed a 64-bit tally.\n");
         return false;
     }
+    plan_column_order(search, 0);
     if (!initialize_perm_counter(&search->permutations)) {
         fprintf(stderr, "Unable to initialize the permutation counter.\n");
         return false;
     }
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    if (!initialize_additive_perm_bounds(search)) {
+        fprintf(stderr, "Unable to initialize additive permutation bounds.\n");
+        return false;
+    }
+#endif
     return true;
 }
 
@@ -1491,12 +2205,72 @@ struct totals {
     uint64_t bound_prunes;
     uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
-    uint64_t pair_prunes;
     uint64_t prefix_place_prunes;
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    uint64_t additive_perm_prunes;
+#endif
     uint64_t all_subset_place_prunes;
     uint64_t all_subset_place_fair_count;
     uint64_t permutation_fair_count;
 };
+
+#define SI_COUNT_TEXT_SIZE 24
+
+/* Keep exact small counts, then use four significant digits and an SI suffix. */
+static void format_si_count(char text[SI_COUNT_TEXT_SIZE], uint64_t value)
+{
+    static const char suffixes[] = "kMGTPE";
+    uint64_t divisor = UINT64_C(1000);
+    uint64_t factor;
+    uint64_t rounded;
+    unsigned suffix = 0;
+
+    if (value <= UINT64_C(9999)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64, value);
+        return;
+    }
+
+    while (suffix + 1U < sizeof(suffixes) - 1U &&
+           value / divisor >= UINT64_C(1000)) {
+        divisor *= UINT64_C(1000);
+        ++suffix;
+    }
+
+    for (;;) {
+        uint64_t whole = value / divisor;
+        uint64_t remainder = value % divisor;
+        uint64_t unit;
+
+        factor = whole >= 100U ? UINT64_C(10) :
+            (whole >= 10U ? UINT64_C(100) : UINT64_C(1000));
+        for (;;) {
+            unit = divisor / factor;
+            rounded = whole * factor +
+                (remainder + unit / 2U) / unit;
+            if (rounded < UINT64_C(10000) || factor == UINT64_C(10)) {
+                break;
+            }
+            factor /= UINT64_C(10);
+        }
+        if (rounded < UINT64_C(10000) ||
+            suffix + 1U >= sizeof(suffixes) - 1U) {
+            break;
+        }
+        divisor *= UINT64_C(1000);
+        ++suffix;
+    }
+
+    if (factor == UINT64_C(1000)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%03" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    } else if (factor == UINT64_C(100)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%02" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    } else {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%01" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    }
+}
 
 static struct totals collect_totals(const struct worker *workers,
                                     unsigned thread_count)
@@ -1513,10 +2287,12 @@ static struct totals collect_totals(const struct worker *workers,
             &workers[i].stats.linear_place_prunes, memory_order_relaxed);
         totals.pair_bound_prunes += atomic_load_explicit(
             &workers[i].stats.pair_bound_prunes, memory_order_relaxed);
-        totals.pair_prunes += atomic_load_explicit(
-            &workers[i].stats.pair_prunes, memory_order_relaxed);
         totals.prefix_place_prunes += atomic_load_explicit(
             &workers[i].stats.prefix_place_prunes, memory_order_relaxed);
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+        totals.additive_perm_prunes += atomic_load_explicit(
+            &workers[i].stats.additive_perm_prunes, memory_order_relaxed);
+#endif
         totals.all_subset_place_prunes += atomic_load_explicit(
             &workers[i].stats.all_subset_place_prunes,
             memory_order_relaxed);
@@ -1529,10 +2305,10 @@ static struct totals collect_totals(const struct worker *workers,
     return totals;
 }
 
-static void run_job(struct worker *worker, uint64_t job)
+static void run_prefix(struct worker *worker, uint64_t prefix)
 {
     struct search *search = &worker->search;
-    uint64_t choices = job;
+    uint64_t choices = prefix;
     unsigned depth;
 
     /* Column zero is the fixed global die-renaming representative. */
@@ -1547,7 +2323,7 @@ static void run_job(struct worker *worker, uint64_t job)
     search_row(search, 0, worker->shared->split_depth + 1U);
 
     depth = worker->shared->split_depth;
-    choices = job;
+    choices = prefix;
     /* Decode again so choices can be undone in reverse order. */
     {
         unsigned selected[SEARCH_COLUMNS];
@@ -1563,20 +2339,50 @@ static void run_job(struct worker *worker, uint64_t job)
     undo_choice(search, 0, 0, 0);
 }
 
+static bool run_job(struct worker *worker, uint64_t job)
+{
+    const struct shared_state *shared = worker->shared;
+    uint64_t prefix = job;
+
+    for (;;) {
+        if (atomic_load_explicit(&shared->stop, memory_order_relaxed)) {
+            return false;
+        }
+        run_prefix(worker, prefix);
+        if (atomic_load_explicit(&shared->stop, memory_order_relaxed)) {
+            return false;
+        }
+        if (shared->job_count >= shared->prefix_count - prefix) {
+            return true;
+        }
+        prefix += shared->job_count;
+    }
+}
+
 static void *worker_main(void *argument)
 {
     struct worker *worker = argument;
     struct shared_state *shared = worker->shared;
 
     while (!atomic_load_explicit(&shared->stop, memory_order_relaxed)) {
-        uint64_t job = atomic_fetch_add_explicit(&shared->next_job, 1,
-                                                 memory_order_relaxed);
-        if (job >= shared->job_count) {
+        uint64_t ticket = atomic_fetch_add_explicit(
+            &shared->next_job, 1, memory_order_relaxed);
+        uint64_t job;
+
+        if (ticket >= shared->job_count || sigint_requested) {
+            if (sigint_requested) {
+                atomic_store_explicit(&shared->stop, true,
+                                      memory_order_relaxed);
+            }
             break;
         }
-        run_job(worker, job);
-        atomic_fetch_add_explicit(&shared->jobs_done, 1,
-                                  memory_order_relaxed);
+        job = shared->job_order == NULL
+            ? ticket
+            : shared->job_order[ticket];
+        if (run_job(worker, job)) {
+            atomic_fetch_add_explicit(&shared->jobs_done, 1,
+                                      memory_order_relaxed);
+        }
         publish_worker_stats(&worker->search);
     }
 
@@ -1623,26 +2429,61 @@ static void print_progress(const struct shared_state *shared,
     struct totals totals = collect_totals(workers, shared->thread_count);
     uint64_t jobs_done = atomic_load_explicit(&shared->jobs_done,
                                               memory_order_relaxed);
+    uint64_t permutation_total = atomic_load_explicit(
+        &shared->permutation_total, memory_order_relaxed);
+    char nodes[SI_COUNT_TEXT_SIZE];
+    char bound_prunes[SI_COUNT_TEXT_SIZE];
+    char linear_place_prunes[SI_COUNT_TEXT_SIZE];
+    char pair_bound_prunes[SI_COUNT_TEXT_SIZE];
+    char permutation_fair[SI_COUNT_TEXT_SIZE];
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    char additive_perm_prunes[SI_COUNT_TEXT_SIZE];
+#elif !PERM_ONLY
+    uint64_t all_subset_total = atomic_load_explicit(
+        &shared->all_subset_total, memory_order_relaxed);
+    char prefix_place_prunes[SI_COUNT_TEXT_SIZE];
+    char all_subset_place_prunes[SI_COUNT_TEXT_SIZE];
+    char all_subset_place_fair[SI_COUNT_TEXT_SIZE];
+#endif
+
+    format_si_count(nodes, totals.nodes);
+    format_si_count(bound_prunes, totals.bound_prunes);
+    format_si_count(linear_place_prunes, totals.linear_place_prunes);
+    format_si_count(pair_bound_prunes, totals.pair_bound_prunes);
+    format_si_count(permutation_fair, permutation_total);
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+    format_si_count(additive_perm_prunes, totals.additive_perm_prunes);
+#elif !PERM_ONLY
+    format_si_count(prefix_place_prunes, totals.prefix_place_prunes);
+    format_si_count(all_subset_place_prunes,
+                    totals.all_subset_place_prunes);
+    format_si_count(all_subset_place_fair, all_subset_total);
+#endif
 
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
-            " nodes=%" PRIu64 " pruned=%" PRIu64
-            " linear-place-pruned=%" PRIu64
-            " pair-bound-pruned=%" PRIu64 " pair-pruned=%" PRIu64
-            " prefix-place-pruned=%" PRIu64
-            " all-subset-place-pruned=%" PRIu64
-            " all-subset-place-fair=%" PRIu64
-            " permutation-fair=%" PRIu64 "\n",
+            " nodes=%s pruned=%s"
+            " linear-place-pruned=%s"
+            " pair-bound-pruned=%s"
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+            " additive-perm-pruned=%s"
+#elif !PERM_ONLY
+            " prefix-place-pruned=%s"
+            " all-subset-place-pruned=%s"
+            " all-subset-place-fair=%s"
+#endif
+            " permutation-fair=%s\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
-            shared->job_count, totals.nodes, totals.bound_prunes,
-            totals.linear_place_prunes, totals.pair_bound_prunes,
-            totals.pair_prunes,
-            totals.prefix_place_prunes,
-            totals.all_subset_place_prunes,
-            atomic_load_explicit(&shared->all_subset_total,
-                                 memory_order_relaxed),
-            atomic_load_explicit(&shared->permutation_total,
-                                 memory_order_relaxed));
+            shared->job_count, nodes, bound_prunes,
+            linear_place_prunes, pair_bound_prunes,
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+            additive_perm_prunes,
+#elif !PERM_ONLY
+            prefix_place_prunes,
+            all_subset_place_prunes,
+            all_subset_place_fair,
+#endif
+            permutation_fair);
     fflush(stderr);
 }
 
@@ -1669,7 +2510,11 @@ static void watch_workers(struct shared_state *shared,
         }
         pthread_mutex_unlock(&shared->completion_mutex);
 
-        if (wait_result != 0 && wait_result != ETIMEDOUT) {
+        if (sigint_requested) {
+            atomic_store_explicit(&shared->stop, true, memory_order_relaxed);
+        }
+        if (wait_result != 0 && wait_result != ETIMEDOUT &&
+            !sigint_requested) {
             atomic_store_explicit(&shared->internal_error, true,
                                   memory_order_relaxed);
             atomic_store_explicit(&shared->stop, true, memory_order_relaxed);
@@ -1686,8 +2531,12 @@ static void watch_workers(struct shared_state *shared,
                  shared->options.print_limit)) {
             fprintf(stderr,
                     "Solution output limited to the first %" PRIu64
+#if PERM_ONLY
+                    " results; use --all-solutions for the complete stream.\n",
+#else
                     " results in each class; use --all-solutions for the "
                     "complete streams.\n",
+#endif
                     shared->options.print_limit);
             suppression_reported = true;
         }
@@ -1718,6 +2567,12 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return EXIT_FAILURE;
     }
+    if (!install_sigint_handler()) {
+        return EXIT_FAILURE;
+    }
+    if (options.random_order && !options.seed_given) {
+        options.seed = default_random_seed();
+    }
 
     requested_threads = options.threads;
     if (requested_threads == 0) {
@@ -1730,11 +2585,32 @@ int main(int argc, char **argv)
 
     memset(&shared, 0, sizeof(shared));
     shared.options = options;
-    shared.job_count = 1;
-    while (shared.split_depth < SEARCH_COLUMNS - 1U &&
-           shared.job_count < (uint64_t)requested_threads * JOBS_PER_WORKER) {
-        shared.job_count *= DICE;
-        ++shared.split_depth;
+    shared.prefix_count = 1;
+    {
+        uint64_t desired_jobs = options.jobs != 0
+            ? options.jobs
+            : (uint64_t)requested_threads * JOBS_PER_WORKER;
+
+        while (shared.split_depth < SEARCH_COLUMNS - 1U &&
+               shared.prefix_count < desired_jobs) {
+            if (shared.prefix_count > UINT64_MAX / DICE) {
+                fprintf(stderr,
+                        "Requested job count requires too many search prefixes.\n");
+                return EXIT_FAILURE;
+            }
+            shared.prefix_count *= DICE;
+            ++shared.split_depth;
+        }
+        shared.job_count = options.jobs != 0 &&
+                           options.jobs < shared.prefix_count
+            ? options.jobs
+            : shared.prefix_count;
+        if (options.jobs != 0 && shared.job_count != options.jobs) {
+            fprintf(stderr,
+                    "Requested %" PRIu64 " jobs, but this search supports at "
+                    "most %" PRIu64 " prefix jobs; using that maximum.\n",
+                    options.jobs, shared.job_count);
+        }
     }
     shared.thread_count = requested_threads;
     if (shared.thread_count > shared.job_count) {
@@ -1754,6 +2630,10 @@ int main(int argc, char **argv)
         pthread_cond_init(&shared.solution_not_full, NULL) != 0) {
         fprintf(stderr, "Unable to initialize pthread synchronization.\n");
         return EXIT_FAILURE;
+    }
+    if (!initialize_job_order(&shared)) {
+        exit_status = EXIT_FAILURE;
+        goto cleanup;
     }
 
     workers = calloc(shared.thread_count, sizeof(*workers));
@@ -1778,29 +2658,48 @@ int main(int argc, char **argv)
         atomic_init(&workers[i].stats.bound_prunes, 0);
         atomic_init(&workers[i].stats.linear_place_prunes, 0);
         atomic_init(&workers[i].stats.pair_bound_prunes, 0);
-        atomic_init(&workers[i].stats.pair_prunes, 0);
         atomic_init(&workers[i].stats.prefix_place_prunes, 0);
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+        atomic_init(&workers[i].stats.additive_perm_prunes, 0);
+#endif
         atomic_init(&workers[i].stats.all_subset_place_prunes, 0);
         atomic_init(&workers[i].stats.all_subset_place_fair_count, 0);
         atomic_init(&workers[i].stats.permutation_fair_count, 0);
     }
 
     fprintf(stderr,
-            "Searching %s%dd%d column-grouped configurations (%s) "
-            "with %u pthread workers (%" PRIu64 " jobs, split depth %u; "
-            "place goal %" PRIu64 ")\n",
+            "Searching %s%s%dd%d column-grouped configurations (%s) "
+            "with %u pthread workers (%" PRIu64 " jobs over %" PRIu64
+            " prefixes, split depth %u; "
+            "place goal %" PRIu64 "; job order=%s",
+            PERM_ONLY ? "permutation-only " : "",
             MIRROR ? "mirrored " : "", DICE, SIDES,
-            MIRROR ? "outer pairs first" :
-                (HIGH_FIRST ? "highest labels first" : "lowest labels first"),
+            traversal_description(),
             shared.thread_count,
-            shared.job_count, shared.split_depth,
-            workers[0].search.place_goal);
+            shared.job_count, shared.prefix_count, shared.split_depth,
+            workers[0].search.place_goal,
+            options.random_order ? "random" : "sequential");
+    if (options.random_order) {
+        fprintf(stderr, ", seed=%" PRIu64, options.seed);
+    }
+    fputs(")\n", stderr);
 
     if (workers[0].search.outcome_count % DICE != 0) {
         fprintf(stderr,
                 "No place-fair configuration is possible because %d^%d "
                 "is not divisible by %d.\n",
                 SIDES, DICE, DICE);
+    } else if ((SIDES % 2U) != 0) {
+        fprintf(stderr,
+                "No all-subset-place-fair configuration is possible because "
+                "%d^2 is not divisible by 2.\n",
+                SIDES);
+#if PERM_ONLY
+    } else if (!workers[0].search.permutation_fairness_possible) {
+        fprintf(stderr,
+                "No permutation-fair configuration is possible because a "
+                "required outcome count is not divisible by its factorial.\n");
+#endif
     } else {
         start_time = monotonic_seconds();
         for (i = 0; i < shared.thread_count; ++i) {
@@ -1845,34 +2744,97 @@ int main(int argc, char **argv)
             double nodes_per_second = elapsed > 0.0
                 ? (double)totals.nodes / elapsed
                 : 0.0;
+            uint64_t rounded_nodes_per_second =
+                nodes_per_second >= (double)UINT64_MAX
+                    ? UINT64_MAX
+                    : (uint64_t)(nodes_per_second + 0.5);
+            uint64_t permutation_total = atomic_load_explicit(
+                &shared.permutation_total, memory_order_relaxed);
             bool hit_limit = options.limit != 0 &&
                 atomic_load_explicit(&shared.limit_claims,
                                      memory_order_relaxed) >= options.limit;
+            char nodes[SI_COUNT_TEXT_SIZE];
+            char node_rate[SI_COUNT_TEXT_SIZE];
+            char bound_prunes[SI_COUNT_TEXT_SIZE];
+            char linear_place_prunes[SI_COUNT_TEXT_SIZE];
+            char pair_bound_prunes[SI_COUNT_TEXT_SIZE];
+            char permutation_fair[SI_COUNT_TEXT_SIZE];
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+            char additive_perm_prunes[SI_COUNT_TEXT_SIZE];
+#elif !PERM_ONLY
+            uint64_t all_subset_total = atomic_load_explicit(
+                &shared.all_subset_total, memory_order_relaxed);
+            char prefix_place_prunes[SI_COUNT_TEXT_SIZE];
+            char all_subset_place_prunes[SI_COUNT_TEXT_SIZE];
+            char all_subset_place_fair[SI_COUNT_TEXT_SIZE];
+#endif
+
+            format_si_count(nodes, totals.nodes);
+            format_si_count(node_rate, rounded_nodes_per_second);
+            format_si_count(bound_prunes, totals.bound_prunes);
+            format_si_count(linear_place_prunes,
+                            totals.linear_place_prunes);
+            format_si_count(pair_bound_prunes, totals.pair_bound_prunes);
+            format_si_count(permutation_fair, permutation_total);
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+            format_si_count(additive_perm_prunes,
+                            totals.additive_perm_prunes);
+#elif !PERM_ONLY
+            format_si_count(prefix_place_prunes,
+                            totals.prefix_place_prunes);
+            format_si_count(all_subset_place_prunes,
+                            totals.all_subset_place_prunes);
+            format_si_count(all_subset_place_fair, all_subset_total);
+#endif
+
+            if (sigint_requested) {
+                fprintf(stderr,
+                        "Interrupted search configuration: %s%s%dd%d "
+                        "column-grouped, traversal=%s, workers=%u, jobs=%"
+                        PRIu64 " over %" PRIu64 " prefixes, split-depth=%u, "
+                        "job-order=%s",
+                        PERM_ONLY ? "permutation-only " : "",
+                        MIRROR ? "mirrored " : "", DICE, SIDES,
+                        traversal_description(), shared.thread_count,
+                        shared.job_count, shared.prefix_count,
+                        shared.split_depth,
+                        options.random_order ? "random" : "sequential");
+                if (options.random_order) {
+                    fprintf(stderr, ", seed=%" PRIu64, options.seed);
+                }
+                fputc('\n', stderr);
+            }
 
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
-                    ", nodes=%" PRIu64 " (%.0f/s), bound-prunes=%" PRIu64
-                    ", linear-place-prunes=%" PRIu64
-                    ", pair-bound-prunes=%" PRIu64
-                    ", pair-prunes=%" PRIu64
-                    ", prefix-place-prunes=%" PRIu64
-                    ", all-subset-place-prunes=%" PRIu64
-                    ", all-subset-place-fair=%" PRIu64
-                    ", permutation-fair=%" PRIu64 "\n",
-                    hit_limit ? "stopped at limit" : "complete", elapsed,
+                    ", nodes=%s (%s/s), bound-prunes=%s"
+                    ", linear-place-prunes=%s"
+                    ", pair-bound-prunes=%s"
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+                    ", additive-perm-prunes=%s"
+#elif !PERM_ONLY
+                    ", prefix-place-prunes=%s"
+                    ", all-subset-place-prunes=%s"
+                    ", all-subset-place-fair=%s"
+#endif
+                    ", permutation-fair=%s\n",
+                    sigint_requested ? "interrupted" :
+                        (hit_limit ? "stopped at limit" : "complete"),
+                    elapsed,
                     shared.thread_count,
                     atomic_load_explicit(&shared.jobs_done,
                                          memory_order_relaxed),
-                    shared.job_count, totals.nodes, nodes_per_second,
-                    totals.bound_prunes, totals.linear_place_prunes,
-                    totals.pair_bound_prunes,
-                    totals.pair_prunes,
-                    totals.prefix_place_prunes,
-                    totals.all_subset_place_prunes,
-                    atomic_load_explicit(&shared.all_subset_total,
-                                         memory_order_relaxed),
-                    atomic_load_explicit(&shared.permutation_total,
-                                         memory_order_relaxed));
+                    shared.job_count, nodes, node_rate,
+                    bound_prunes, linear_place_prunes,
+                    pair_bound_prunes,
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+                    additive_perm_prunes,
+#elif !PERM_ONLY
+                    prefix_place_prunes,
+                    all_subset_place_prunes,
+                    all_subset_place_fair,
+#endif
+                    permutation_fair);
         }
     }
 
@@ -1880,10 +2842,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "A worker reported an internal search error.\n");
         exit_status = EXIT_FAILURE;
     }
+    if (sigint_requested && exit_status == EXIT_SUCCESS) {
+        exit_status = 128 + SIGINT;
+    }
 
 cleanup:
     drain_solutions(&shared);
     free(workers);
+    free(shared.job_order);
     pthread_cond_destroy(&shared.solution_not_full);
     pthread_mutex_destroy(&shared.solution_mutex);
     pthread_cond_destroy(&shared.completion_condition);
