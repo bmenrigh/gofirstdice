@@ -7,7 +7,7 @@
  * defaults with, for example:
  *
  *   cc -std=c11 -O3 -march=native -flto \
- *      -DDICE=4 -DSIDES=18 -DMIRROR=1 \
+ *      -DDICE=4 -DSIDES=18 -DMIRROR=1 -DHIGH_FIRST=1 \
  *      -o column_search column_search.c
  *
  * A column contains DICE consecutive labels and assigns one label to each
@@ -40,12 +40,26 @@
 #define MIRROR 0
 #endif
 
+#ifndef HIGH_FIRST
+#define HIGH_FIRST 1
+#endif
+
 #if MIRROR != 0 && MIRROR != 1
 #error "MIRROR must be either 0 or 1"
 #endif
 
+#if HIGH_FIRST != 0 && HIGH_FIRST != 1
+#error "HIGH_FIRST must be either 0 or 1"
+#endif
+
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
+#endif
+
+#if !MIRROR && SIDES <= 255
+#define PACKED_PAIR_WINS 1
+#else
+#define PACKED_PAIR_WINS 0
 #endif
 
 #define FACE_COUNT (DICE * SIDES)
@@ -59,28 +73,45 @@
 #define PROGRESS_CHECK_MASK UINT64_C(0x3ffff)
 #define JOBS_PER_WORKER UINT64_C(8)
 #define MAX_THREADS 256U
+#define SOLUTION_QUEUE_CAPACITY 256U
+#ifndef PAIR_BOUND_START
+#if PACKED_PAIR_WINS
+#define PAIR_BOUND_START 0U
+#else
+#define PAIR_BOUND_START (SIDES / 2U)
+#endif
+#endif
 
 /* Number of permutations and partial permutations, including the empty one. */
 #if DICE == 2
 #define DICE_FACTORIAL UINT64_C(2)
 #define PERM_STATE_COUNT 5
+#define PERM_EDGE_COUNT 2
 #elif DICE == 3
 #define DICE_FACTORIAL UINT64_C(6)
 #define PERM_STATE_COUNT 16
+#define PERM_EDGE_COUNT 5
 #elif DICE == 4
 #define DICE_FACTORIAL UINT64_C(24)
 #define PERM_STATE_COUNT 65
+#define PERM_EDGE_COUNT 16
 #elif DICE == 5
 #define DICE_FACTORIAL UINT64_C(120)
 #define PERM_STATE_COUNT 326
+#define PERM_EDGE_COUNT 65
 #elif DICE == 6
 #define DICE_FACTORIAL UINT64_C(720)
 #define PERM_STATE_COUNT 1957
+#define PERM_EDGE_COUNT 326
 #else
 #error "column_search supports DICE values from 2 through 6"
 #endif
 
 _Static_assert(SIDES > 0, "SIDES must be positive");
+_Static_assert(PAIR_BOUND_START <= SEARCH_COLUMNS,
+               "PAIR_BOUND_START exceeds the searched columns");
+_Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
+               "permutation state indices must fit in uint16_t");
 
 struct options {
     uint64_t limit;
@@ -96,9 +127,14 @@ struct perm_state {
     unsigned length;
 };
 
+struct perm_edge {
+    uint16_t source;
+    uint16_t destination;
+};
+
 struct perm_counter {
     struct perm_state state[PERM_STATE_COUNT];
-    int transition[PERM_STATE_COUNT][DICE];
+    struct perm_edge edge[DICE][PERM_EDGE_COUNT];
     uint64_t ways[PERM_STATE_COUNT];
     size_t length_begin[DICE + 2];
 };
@@ -118,10 +154,18 @@ struct search {
     /* Safe suffix bounds for the die currently being filled. */
     uint64_t minimum_left[DICE][SEARCH_COLUMNS + 1][DICE];
     uint64_t maximum_left[DICE][SEARCH_COLUMNS + 1][DICE];
+#if PACKED_PAIR_WINS
+    /* One byte-wide win counter per previous die, packed into a word. */
+    uint64_t pair_wins[DICE];
+    uint64_t pair_increment[DICE][SEARCH_COLUMNS][DICE];
+    uint64_t pair_minimum_left[DICE][SEARCH_COLUMNS + 1];
+    uint64_t pair_maximum_left[DICE][SEARCH_COLUMNS + 1];
+#elif !MIRROR
+    unsigned pair_wins[DICE][DICE];
+#endif
 
     uint64_t outcome_count;
     uint64_t place_goal;
-    uint64_t permutation_goal;
     bool permutation_fairness_possible;
 
     struct perm_counter permutations;
@@ -130,21 +174,26 @@ struct search {
 
     uint64_t nodes;
     uint64_t bound_prunes;
+    uint64_t pair_bound_prunes;
     uint64_t pair_prunes;
-    uint64_t place_fair_count;
+    uint64_t prefix_place_prunes;
+    uint64_t prefix_perm_prunes;
+    uint64_t candidate_count;
     uint64_t permutation_fair_count;
 };
 
 struct worker_stats {
     atomic_uint_fast64_t nodes;
     atomic_uint_fast64_t bound_prunes;
+    atomic_uint_fast64_t pair_bound_prunes;
     atomic_uint_fast64_t pair_prunes;
-    atomic_uint_fast64_t place_fair_count;
+    atomic_uint_fast64_t prefix_place_prunes;
+    atomic_uint_fast64_t prefix_perm_prunes;
+    atomic_uint_fast64_t candidate_count;
     atomic_uint_fast64_t permutation_fair_count;
 };
 
 struct solution {
-    struct solution *next;
     uint64_t number;
     char encoding[FACE_COUNT + 1];
 };
@@ -167,8 +216,11 @@ struct shared_state {
     unsigned workers_running;
 
     pthread_mutex_t solution_mutex;
-    struct solution *solution_head;
-    struct solution *solution_tail;
+    pthread_cond_t solution_not_full;
+    struct solution solution_queue[SOLUTION_QUEUE_CAPACITY];
+    unsigned solution_head;
+    unsigned solution_tail;
+    unsigned solution_count;
 };
 
 struct worker {
@@ -185,10 +237,11 @@ static void usage(FILE *stream, const char *program)
             "Usage: %s [OPTIONS]\n"
             "\n"
             "Search the compile-time-selected %s%dd%d column-grouped space.\n"
-            "The first column is fixed to remove equivalent die renamings.\n"
+            "The first searched column is fixed to remove equivalent die "
+            "renamings.\n"
             "\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
-            "  -n, --limit N       stop after N place-and-pair-fair candidates\n"
+            "  -n, --limit N       stop after N surviving permutation candidates\n"
             "  -p, --progress N    progress interval in seconds; 0 disables\n"
             "      --print-limit N print at most N permutation-fair solutions\n"
             "      --all-solutions print every permutation-fair solution\n"
@@ -424,21 +477,34 @@ static bool initialize_perm_counter(struct perm_counter *counter)
         return false;
     }
 
-    for (next = 0; next < PERM_STATE_COUNT; ++next) {
-        const struct perm_state *state = &counter->state[next];
+    {
         unsigned die;
-
         for (die = 0; die < DICE; ++die) {
-            if ((state->mask & (1U << die)) != 0 || state->length == DICE) {
-                counter->transition[next][die] = -1;
-            } else {
+            size_t edge_count = 0;
+            next = PERM_STATE_COUNT;
+            while (next-- > 0) {
+                const struct perm_state *state = &counter->state[next];
+                int destination;
                 uint64_t key = state->key |
                     ((uint64_t)(die + 1U) << (4U * state->length));
-                counter->transition[next][die] =
-                    find_perm_state(counter, state->length + 1U, key);
-                if (counter->transition[next][die] < 0) {
+
+                if ((state->mask & (1U << die)) != 0 ||
+                    state->length == DICE) {
+                    continue;
+                }
+                destination = find_perm_state(
+                    counter, state->length + 1U, key);
+                if (destination < 0 || edge_count >= PERM_EDGE_COUNT) {
                     return false;
                 }
+                counter->edge[die][edge_count] = (struct perm_edge){
+                    .source = (uint16_t)next,
+                    .destination = (uint16_t)destination,
+                };
+                ++edge_count;
+            }
+            if (edge_count != PERM_EDGE_COUNT) {
+                return false;
             }
         }
     }
@@ -457,41 +523,69 @@ static void build_owner_table(struct search *search)
     }
 }
 
-/* Count roll orderings by scanning labels from low to high. */
-static bool check_permutation_fairness(struct search *search)
+/* Count one subset's roll orderings by scanning labels from low to high. */
+static bool subset_is_permutation_fair(struct search *search,
+                                       unsigned subset_mask,
+                                       unsigned subset_size)
 {
     struct perm_counter *counter = &search->permutations;
+    uint64_t subset_outcomes;
+    uint64_t subset_factorial = 1;
+    uint64_t goal;
     unsigned face;
+    unsigned i;
+
+    if (subset_size > DICE || subset_mask >= (1U << DICE)) {
+        return false;
+    }
+    if (!integer_power(SIDES, subset_size, &subset_outcomes)) {
+        return false;
+    }
+    for (i = 2; i <= subset_size; ++i) {
+        subset_factorial *= i;
+    }
+    if (subset_outcomes % subset_factorial != 0) {
+        return false;
+    }
+    goal = subset_outcomes / subset_factorial;
 
     memset(counter->ways, 0, sizeof(counter->ways));
     counter->ways[0] = 1; /* one way to choose an empty ordering */
 
     for (face = 0; face < FACE_COUNT; ++face) {
         unsigned owner = search->owner[face];
-        size_t i = PERM_STATE_COUNT;
+        size_t edge;
 
-        /* Destinations have greater indices, so reverse traversal is in-place. */
-        while (i-- > 0) {
-            int destination = counter->transition[i][owner];
-            if (destination >= 0) {
-                counter->ways[destination] += counter->ways[i];
-            }
+        if ((subset_mask & (1U << owner)) == 0) {
+            continue;
+        }
+        /* Edges are stored by descending source for safe in-place updates. */
+        for (edge = 0; edge < PERM_EDGE_COUNT; ++edge) {
+            const struct perm_edge *transition = &counter->edge[owner][edge];
+            counter->ways[transition->destination] +=
+                counter->ways[transition->source];
         }
     }
 
-    if (!search->permutation_fairness_possible) {
-        return false;
-    }
     {
-        size_t i;
-        for (i = counter->length_begin[DICE];
-             i < counter->length_begin[DICE + 1]; ++i) {
-            if (counter->ways[i] != search->permutation_goal) {
+        size_t state;
+        for (state = counter->length_begin[subset_size];
+             state < counter->length_begin[subset_size + 1U]; ++state) {
+            if (counter->state[state].mask == subset_mask &&
+                counter->ways[state] != goal) {
                 return false;
             }
         }
     }
     return true;
+}
+
+static bool check_permutation_fairness(struct search *search)
+{
+    if (!search->permutation_fairness_possible) {
+        return false;
+    }
+    return subset_is_permutation_fair(search, (1U << DICE) - 1U, DICE);
 }
 
 static void initialize_grid(struct search *search)
@@ -523,15 +617,38 @@ static void initialize_grid(struct search *search)
 #endif
 }
 
+/* Translate recursion depth to the physical face-label column. */
+static unsigned physical_column(unsigned search_column)
+{
+#if MIRROR || !HIGH_FIRST
+    return search_column;
+#else
+    return SIDES - search_column - 1U;
+#endif
+}
+
+#if !MIRROR
+static bool pair_tracking_active(unsigned column)
+{
+#if PAIR_BOUND_START == 0
+    (void)column;
+    return true;
+#else
+    return column >= PAIR_BOUND_START;
+#endif
+}
+#endif
+
 static uint64_t choice_contribution(const struct search *search,
                                     unsigned candidate, unsigned column,
                                     unsigned place)
 {
-    unsigned face = search->grid[candidate][column];
+    unsigned actual_column = physical_column(column);
+    unsigned face = search->grid[candidate][actual_column];
     uint64_t contribution = search->contribution[face][place];
 
 #if MIRROR
-    unsigned mirror_column = SIDES - column - 1U;
+    unsigned mirror_column = SIDES - actual_column - 1U;
     unsigned mirror_face = search->grid[candidate][mirror_column];
     contribution += search->contribution[mirror_face][place];
 #endif
@@ -552,8 +669,9 @@ static void build_bounds(struct search *search, unsigned row)
             uint64_t minimum = UINT64_MAX;
             uint64_t maximum = 0;
             unsigned candidate;
+            unsigned candidate_limit = column == 0 ? row + 1U : DICE;
 
-            for (candidate = row; candidate < DICE; ++candidate) {
+            for (candidate = row; candidate < candidate_limit; ++candidate) {
                 uint64_t value = choice_contribution(
                     search, candidate, (unsigned)column, place);
                 if (value < minimum) {
@@ -569,6 +687,46 @@ static void build_bounds(struct search *search, unsigned row)
                 search->maximum_left[row][column + 1][place];
         }
     }
+
+#if PACKED_PAIR_WINS
+    {
+        uint64_t lane_ones = 0;
+        unsigned previous;
+        int column;
+
+        for (previous = 0; previous < row; ++previous) {
+            lane_ones |= UINT64_C(1) << (previous * 8U);
+        }
+        search->pair_minimum_left[row][SEARCH_COLUMNS] = 0;
+        search->pair_maximum_left[row][SEARCH_COLUMNS] = 0;
+        for (column = SEARCH_COLUMNS - 1; column >= 0; --column) {
+            unsigned actual_column = physical_column((unsigned)column);
+            unsigned candidate_limit = column == 0 ? row + 1U : DICE;
+            uint64_t any_wins = 0;
+            uint64_t all_win = lane_ones;
+            unsigned candidate;
+
+            for (candidate = row; candidate < candidate_limit; ++candidate) {
+                uint64_t increment = 0;
+
+                for (previous = 0; previous < row; ++previous) {
+                    if (search->grid[candidate][actual_column] >
+                        search->grid[previous][actual_column]) {
+                        increment |= UINT64_C(1) << (previous * 8U);
+                    }
+                }
+                search->pair_increment[row][column][candidate] = increment;
+                any_wins |= increment;
+                all_win &= increment;
+            }
+            search->pair_minimum_left[row][column] = all_win +
+                search->pair_minimum_left[row][column + 1];
+            search->pair_maximum_left[row][column] = any_wins +
+                search->pair_maximum_left[row][column + 1];
+        }
+    }
+#endif
+
 }
 
 static bool bounds_allow_goal(const struct search *search,
@@ -591,6 +749,91 @@ static bool bounds_allow_goal(const struct search *search,
     }
     return true;
 }
+
+static bool pair_bounds_allow_goal(const struct search *search,
+                                   unsigned row, unsigned column)
+{
+#if MIRROR
+    (void)search;
+    (void)row;
+    (void)column;
+    return true;
+#else
+    unsigned previous;
+    unsigned goal = SIDES / 2U;
+    unsigned remaining;
+
+    /* Large-side fallback builds may defer tracking to limit bookkeeping. */
+    if (row == 0) {
+        return true;
+    }
+#if PAIR_BOUND_START != 0
+    if (column < PAIR_BOUND_START) {
+        return true;
+    }
+#endif
+    remaining = SEARCH_COLUMNS - column;
+    for (previous = 0; previous < row; ++previous) {
+#if PACKED_PAIR_WINS
+        unsigned shift = previous * 8U;
+        unsigned current = (unsigned)((search->pair_wins[row] >>
+                                       shift) & UINT64_C(0xff));
+        unsigned minimum = (unsigned)(
+            (search->pair_minimum_left[row][column] >> shift) &
+            UINT64_C(0xff));
+        unsigned maximum = (unsigned)(
+            (search->pair_maximum_left[row][column] >> shift) &
+            UINT64_C(0xff));
+        unsigned needed;
+#else
+        unsigned current = search->pair_wins[row][previous];
+#endif
+
+        if (current > goal || current + remaining < goal) {
+            return false;
+        }
+#if PACKED_PAIR_WINS
+        needed = goal - current;
+        if (minimum > needed || maximum < needed) {
+            return false;
+        }
+#endif
+    }
+    return true;
+#endif
+}
+
+#if !MIRROR
+static void initialize_pair_wins(struct search *search, unsigned row,
+                                 unsigned assigned_columns)
+{
+    unsigned previous;
+#if PACKED_PAIR_WINS
+    uint64_t packed_wins = 0;
+#endif
+
+    for (previous = 0; previous < row; ++previous) {
+        unsigned wins = 0;
+        unsigned column;
+
+        for (column = 0; column < assigned_columns; ++column) {
+            unsigned actual_column = physical_column(column);
+            if (search->grid[row][actual_column] >
+                search->grid[previous][actual_column]) {
+                ++wins;
+            }
+        }
+#if PACKED_PAIR_WINS
+        packed_wins |= (uint64_t)wins << (previous * 8U);
+#else
+        search->pair_wins[row][previous] = wins;
+#endif
+    }
+#if PACKED_PAIR_WINS
+    search->pair_wins[row] = packed_wins;
+#endif
+}
+#endif
 
 static bool configuration_is_place_fair(const struct search *search)
 {
@@ -644,6 +887,91 @@ static bool die_is_pairwise_fair(const struct search *search, unsigned die)
 #endif
 }
 
+/*
+ * A permutation-fair prefix must first be place-fair as a standalone dice
+ * set.  This cheaper test counts ranks by scanning labels from low to high.
+ */
+static bool completed_prefix_is_place_fair(const struct search *search,
+                                           unsigned dice_built)
+{
+    uint64_t tally[DICE][DICE] = {{0}};
+    unsigned faces_below[DICE] = {0};
+    uint64_t subset_outcomes;
+    uint64_t goal;
+    unsigned face;
+    unsigned die;
+
+    if (dice_built < 3U) {
+        return true;
+    }
+    if (!integer_power(SIDES, dice_built, &subset_outcomes) ||
+        subset_outcomes % dice_built != 0) {
+        return false;
+    }
+    goal = subset_outcomes / dice_built;
+
+    for (face = 0; face < FACE_COUNT; ++face) {
+        unsigned owner = search->owner[face];
+        uint64_t polynomial[DICE + 1] = {0};
+        unsigned degree = 0;
+        unsigned opponent;
+
+        if (owner >= dice_built) {
+            continue;
+        }
+        polynomial[0] = 1;
+        for (opponent = 0; opponent < dice_built; ++opponent) {
+            uint64_t next[DICE + 1] = {0};
+            uint64_t below;
+            uint64_t above;
+            unsigned place;
+
+            if (opponent == owner) {
+                continue;
+            }
+            below = faces_below[opponent];
+            above = SIDES - below;
+            for (place = 0; place <= degree; ++place) {
+                next[place] += polynomial[place] * below;
+                next[place + 1U] += polynomial[place] * above;
+            }
+            memcpy(polynomial, next, sizeof(polynomial));
+            ++degree;
+        }
+        for (degree = 0; degree < dice_built; ++degree) {
+            tally[owner][degree] += polynomial[degree];
+        }
+        ++faces_below[owner];
+    }
+
+    for (die = 0; die < dice_built; ++die) {
+        unsigned place;
+
+        if (faces_below[die] != SIDES) {
+            return false;
+        }
+        for (place = 0; place < dice_built; ++place) {
+            if (tally[die][place] != goal) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Every prefix subset of a permutation-fair set must itself be fair. */
+static bool completed_prefix_is_permutation_fair(struct search *search,
+                                                 unsigned dice_built)
+{
+    unsigned subset_mask;
+
+    if (dice_built < 3U) {
+        return true;
+    }
+    subset_mask = (1U << dice_built) - 1U;
+    return subset_is_permutation_fair(search, subset_mask, dice_built);
+}
+
 static double monotonic_seconds(void)
 {
     struct timespec now;
@@ -661,10 +989,19 @@ static void publish_worker_stats(struct search *search)
                           memory_order_relaxed);
     atomic_store_explicit(&search->published->bound_prunes,
                           search->bound_prunes, memory_order_relaxed);
+    atomic_store_explicit(&search->published->pair_bound_prunes,
+                          search->pair_bound_prunes,
+                          memory_order_relaxed);
     atomic_store_explicit(&search->published->pair_prunes,
                           search->pair_prunes, memory_order_relaxed);
-    atomic_store_explicit(&search->published->place_fair_count,
-                          search->place_fair_count, memory_order_relaxed);
+    atomic_store_explicit(&search->published->prefix_place_prunes,
+                          search->prefix_place_prunes,
+                          memory_order_relaxed);
+    atomic_store_explicit(&search->published->prefix_perm_prunes,
+                          search->prefix_perm_prunes,
+                          memory_order_relaxed);
+    atomic_store_explicit(&search->published->candidate_count,
+                          search->candidate_count, memory_order_relaxed);
     atomic_store_explicit(&search->published->permutation_fair_count,
                           search->permutation_fair_count,
                           memory_order_relaxed);
@@ -673,37 +1010,37 @@ static void publish_worker_stats(struct search *search)
 static void record_solution(struct search *search)
 {
     struct shared_state *shared = search->shared;
-    struct solution *solution = NULL;
     uint64_t number;
     unsigned face;
+    bool enqueued = false;
 
     pthread_mutex_lock(&shared->solution_mutex);
     number = atomic_fetch_add_explicit(&shared->permutation_total, 1,
                                        memory_order_relaxed) + 1U;
     if (number <= shared->options.print_limit) {
-        solution = malloc(sizeof(*solution));
-        if (solution != NULL) {
-            solution->next = NULL;
-            solution->number = number;
-            for (face = 0; face < FACE_COUNT; ++face) {
-                solution->encoding[face] =
-                    (char)('A' + search->owner[face]);
-            }
-            solution->encoding[FACE_COUNT] = '\0';
-            if (shared->solution_tail == NULL) {
-                shared->solution_head = solution;
-            } else {
-                shared->solution_tail->next = solution;
-            }
-            shared->solution_tail = solution;
+        struct solution *solution;
+
+        while (shared->solution_count == SOLUTION_QUEUE_CAPACITY) {
+            pthread_cond_wait(&shared->solution_not_full,
+                              &shared->solution_mutex);
         }
+        solution = &shared->solution_queue[shared->solution_tail];
+        solution->number = number;
+        for (face = 0; face < FACE_COUNT; ++face) {
+            solution->encoding[face] =
+                (char)('A' + search->owner[face]);
+        }
+        solution->encoding[FACE_COUNT] = '\0';
+        shared->solution_tail =
+            (shared->solution_tail + 1U) % SOLUTION_QUEUE_CAPACITY;
+        ++shared->solution_count;
+        enqueued = true;
     }
     pthread_mutex_unlock(&shared->solution_mutex);
 
-    if (number <= shared->options.print_limit && solution == NULL) {
-        atomic_store_explicit(&shared->internal_error, true,
-                              memory_order_relaxed);
-        atomic_store_explicit(&shared->stop, true, memory_order_relaxed);
+    /* Wake the watcher so redirected all-solution output drains promptly. */
+    if (enqueued) {
+        pthread_cond_signal(&shared->completion_condition);
     }
 }
 
@@ -730,7 +1067,7 @@ static void accept_configuration(struct search *search)
         }
     }
 
-    ++search->place_fair_count;
+    ++search->candidate_count;
     build_owner_table(search);
     permutation_fair = check_permutation_fairness(search);
     if (permutation_fair) {
@@ -747,17 +1084,35 @@ static void accept_configuration(struct search *search)
 static void apply_choice(struct search *search, unsigned row,
                          unsigned column, unsigned candidate)
 {
-    unsigned temporary = search->grid[row][column];
+    unsigned actual_column = physical_column(column);
+    unsigned temporary = search->grid[row][actual_column];
     unsigned chosen_face;
     unsigned place;
 
-    search->grid[row][column] = search->grid[candidate][column];
-    search->grid[candidate][column] = temporary;
-    chosen_face = search->grid[row][column];
+    search->grid[row][actual_column] = search->grid[candidate][actual_column];
+    search->grid[candidate][actual_column] = temporary;
+    chosen_face = search->grid[row][actual_column];
+
+#if !MIRROR
+    if (pair_tracking_active(column)) {
+#if PACKED_PAIR_WINS
+        search->pair_wins[row] +=
+            search->pair_increment[row][column][candidate];
+#else
+        unsigned previous;
+
+        for (previous = 0; previous < row; ++previous) {
+            if (chosen_face > search->grid[previous][actual_column]) {
+                ++search->pair_wins[row][previous];
+            }
+        }
+#endif
+    }
+#endif
 
 #if MIRROR
     {
-        unsigned mirror_column = SIDES - column - 1U;
+        unsigned mirror_column = SIDES - actual_column - 1U;
         temporary = search->grid[row][mirror_column];
         search->grid[row][mirror_column] =
             search->grid[candidate][mirror_column];
@@ -777,9 +1132,27 @@ static void apply_choice(struct search *search, unsigned row,
 static void undo_choice(struct search *search, unsigned row,
                         unsigned column, unsigned candidate)
 {
-    unsigned chosen_face = search->grid[row][column];
+    unsigned actual_column = physical_column(column);
+    unsigned chosen_face = search->grid[row][actual_column];
     unsigned place;
     unsigned temporary;
+
+#if !MIRROR
+    if (pair_tracking_active(column)) {
+#if PACKED_PAIR_WINS
+        search->pair_wins[row] -=
+            search->pair_increment[row][column][candidate];
+#else
+        unsigned previous;
+
+        for (previous = 0; previous < row; ++previous) {
+            if (chosen_face > search->grid[previous][actual_column]) {
+                --search->pair_wins[row][previous];
+            }
+        }
+#endif
+    }
+#endif
 
     for (place = 0; place < DICE; ++place) {
         search->tally[row][place] -= search->contribution[chosen_face][place];
@@ -789,12 +1162,12 @@ static void undo_choice(struct search *search, unsigned row,
 #endif
     }
 
-    temporary = search->grid[row][column];
-    search->grid[row][column] = search->grid[candidate][column];
-    search->grid[candidate][column] = temporary;
+    temporary = search->grid[row][actual_column];
+    search->grid[row][actual_column] = search->grid[candidate][actual_column];
+    search->grid[candidate][actual_column] = temporary;
 #if MIRROR
     {
-        unsigned mirror_column = SIDES - column - 1U;
+        unsigned mirror_column = SIDES - actual_column - 1U;
         temporary = search->grid[row][mirror_column];
         search->grid[row][mirror_column] =
             search->grid[candidate][mirror_column];
@@ -827,8 +1200,17 @@ static void search_row(struct search *search, unsigned row, unsigned column)
     if (column == 0) {
         build_bounds(search, row);
     }
+#if !MIRROR
+    if (row != 0 && column == PAIR_BOUND_START) {
+        initialize_pair_wins(search, row, column);
+    }
+#endif
     if (!bounds_allow_goal(search, row, column)) {
         ++search->bound_prunes;
+        return;
+    }
+    if (!pair_bounds_allow_goal(search, row, column)) {
+        ++search->pair_bound_prunes;
         return;
     }
 
@@ -839,8 +1221,22 @@ static void search_row(struct search *search, unsigned row, unsigned column)
                 return;
             }
         }
+#if !MIRROR && ((SIDES % 2) != 0)
+        /* Odd sides cannot split the same-column wins exactly in half. */
         if (!die_is_pairwise_fair(search, row)) {
             ++search->pair_prunes;
+            return;
+        }
+#endif
+        if (row + 1U >= 3U) {
+            build_owner_table(search);
+        }
+        if (!completed_prefix_is_place_fair(search, row + 1U)) {
+            ++search->prefix_place_prunes;
+            return;
+        }
+        if (!completed_prefix_is_permutation_fair(search, row + 1U)) {
+            ++search->prefix_perm_prunes;
             return;
         }
         if (row + 1U < DICE - 1U) {
@@ -881,9 +1277,6 @@ static bool initialize_search(struct search *search)
     search->place_goal = search->outcome_count / DICE;
     search->permutation_fairness_possible =
         search->outcome_count % DICE_FACTORIAL == 0;
-    if (search->permutation_fairness_possible) {
-        search->permutation_goal = search->outcome_count / DICE_FACTORIAL;
-    }
 
     initialize_grid(search);
     if (!build_contributions(search)) {
@@ -900,8 +1293,11 @@ static bool initialize_search(struct search *search)
 struct totals {
     uint64_t nodes;
     uint64_t bound_prunes;
+    uint64_t pair_bound_prunes;
     uint64_t pair_prunes;
-    uint64_t place_fair_count;
+    uint64_t prefix_place_prunes;
+    uint64_t prefix_perm_prunes;
+    uint64_t candidate_count;
     uint64_t permutation_fair_count;
 };
 
@@ -916,10 +1312,16 @@ static struct totals collect_totals(const struct worker *workers,
                                              memory_order_relaxed);
         totals.bound_prunes += atomic_load_explicit(
             &workers[i].stats.bound_prunes, memory_order_relaxed);
+        totals.pair_bound_prunes += atomic_load_explicit(
+            &workers[i].stats.pair_bound_prunes, memory_order_relaxed);
         totals.pair_prunes += atomic_load_explicit(
             &workers[i].stats.pair_prunes, memory_order_relaxed);
-        totals.place_fair_count += atomic_load_explicit(
-            &workers[i].stats.place_fair_count, memory_order_relaxed);
+        totals.prefix_place_prunes += atomic_load_explicit(
+            &workers[i].stats.prefix_place_prunes, memory_order_relaxed);
+        totals.prefix_perm_prunes += atomic_load_explicit(
+            &workers[i].stats.prefix_perm_prunes, memory_order_relaxed);
+        totals.candidate_count += atomic_load_explicit(
+            &workers[i].stats.candidate_count, memory_order_relaxed);
         totals.permutation_fair_count += atomic_load_explicit(
             &workers[i].stats.permutation_fair_count, memory_order_relaxed);
     }
@@ -987,20 +1389,25 @@ static void *worker_main(void *argument)
 
 static void drain_solutions(struct shared_state *shared)
 {
-    struct solution *solution;
+    for (;;) {
+        struct solution solution;
+        bool have_solution;
 
-    pthread_mutex_lock(&shared->solution_mutex);
-    solution = shared->solution_head;
-    shared->solution_head = NULL;
-    shared->solution_tail = NULL;
-    pthread_mutex_unlock(&shared->solution_mutex);
-
-    while (solution != NULL) {
-        struct solution *next = solution->next;
+        pthread_mutex_lock(&shared->solution_mutex);
+        have_solution = shared->solution_count != 0;
+        if (have_solution) {
+            solution = shared->solution_queue[shared->solution_head];
+            shared->solution_head =
+                (shared->solution_head + 1U) % SOLUTION_QUEUE_CAPACITY;
+            --shared->solution_count;
+            pthread_cond_signal(&shared->solution_not_full);
+        }
+        pthread_mutex_unlock(&shared->solution_mutex);
+        if (!have_solution) {
+            break;
+        }
         printf("permutation-fair #%" PRIu64 " encoding=%s\n",
-               solution->number, solution->encoding);
-        free(solution);
-        solution = next;
+               solution.number, solution.encoding);
     }
     fflush(stdout);
 }
@@ -1016,11 +1423,17 @@ static void print_progress(const struct shared_state *shared,
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
             " nodes=%" PRIu64 " pruned=%" PRIu64
-            " pair-pruned=%" PRIu64 " place+pair-fair=%" PRIu64
+            " pair-bound-pruned=%" PRIu64 " pair-pruned=%" PRIu64
+            " prefix-place-pruned=%" PRIu64
+            " prefix-perm-pruned=%" PRIu64
+            " perm-candidates=%" PRIu64
             " permutation-fair=%" PRIu64 "\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
-            shared->job_count, totals.nodes, totals.bound_prunes, totals.pair_prunes,
-            totals.place_fair_count,
+            shared->job_count, totals.nodes, totals.bound_prunes,
+            totals.pair_bound_prunes, totals.pair_prunes,
+            totals.prefix_place_prunes,
+            totals.prefix_perm_prunes,
+            totals.candidate_count,
             atomic_load_explicit(&shared->permutation_total,
                                  memory_order_relaxed));
     fflush(stderr);
@@ -1030,6 +1443,7 @@ static void watch_workers(struct shared_state *shared,
                           const struct worker *workers, double start_time)
 {
     bool suppression_reported = false;
+    double last_progress = start_time;
 
     for (;;) {
         unsigned running;
@@ -1038,18 +1452,12 @@ static void watch_workers(struct shared_state *shared,
         pthread_mutex_lock(&shared->completion_mutex);
         running = shared->workers_running;
         if (running != 0) {
-            if (shared->options.progress_seconds == 0) {
-                wait_result = pthread_cond_wait(&shared->completion_condition,
-                                                &shared->completion_mutex);
-            } else {
-                struct timespec deadline;
-                clock_gettime(CLOCK_REALTIME, &deadline);
-                deadline.tv_sec +=
-                    (time_t)shared->options.progress_seconds;
-                wait_result = pthread_cond_timedwait(
-                    &shared->completion_condition, &shared->completion_mutex,
-                    &deadline);
-            }
+            struct timespec deadline;
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            ++deadline.tv_sec;
+            wait_result = pthread_cond_timedwait(
+                &shared->completion_condition, &shared->completion_mutex,
+                &deadline);
             running = shared->workers_running;
         }
         pthread_mutex_unlock(&shared->completion_mutex);
@@ -1075,9 +1483,11 @@ static void watch_workers(struct shared_state *shared,
         if (running == 0) {
             break;
         }
-        if (wait_result == ETIMEDOUT &&
-            shared->options.progress_seconds != 0) {
+        if (shared->options.progress_seconds != 0 &&
+            monotonic_seconds() - last_progress >=
+                (double)shared->options.progress_seconds) {
             print_progress(shared, workers, start_time, running);
+            last_progress = monotonic_seconds();
         }
     }
 }
@@ -1128,7 +1538,8 @@ int main(int argc, char **argv)
     atomic_init(&shared.internal_error, false);
     if (pthread_mutex_init(&shared.completion_mutex, NULL) != 0 ||
         pthread_cond_init(&shared.completion_condition, NULL) != 0 ||
-        pthread_mutex_init(&shared.solution_mutex, NULL) != 0) {
+        pthread_mutex_init(&shared.solution_mutex, NULL) != 0 ||
+        pthread_cond_init(&shared.solution_not_full, NULL) != 0) {
         fprintf(stderr, "Unable to initialize pthread synchronization.\n");
         return EXIT_FAILURE;
     }
@@ -1153,16 +1564,22 @@ int main(int argc, char **argv)
         workers[i].search.published = &workers[i].stats;
         atomic_init(&workers[i].stats.nodes, 0);
         atomic_init(&workers[i].stats.bound_prunes, 0);
+        atomic_init(&workers[i].stats.pair_bound_prunes, 0);
         atomic_init(&workers[i].stats.pair_prunes, 0);
-        atomic_init(&workers[i].stats.place_fair_count, 0);
+        atomic_init(&workers[i].stats.prefix_place_prunes, 0);
+        atomic_init(&workers[i].stats.prefix_perm_prunes, 0);
+        atomic_init(&workers[i].stats.candidate_count, 0);
         atomic_init(&workers[i].stats.permutation_fair_count, 0);
     }
 
     fprintf(stderr,
-            "Searching %s%dd%d column-grouped configurations "
+            "Searching %s%dd%d column-grouped configurations (%s) "
             "with %u pthread workers (%" PRIu64 " jobs, split depth %u; "
             "place goal %" PRIu64 ")\n",
-            MIRROR ? "mirrored " : "", DICE, SIDES, shared.thread_count,
+            MIRROR ? "mirrored " : "", DICE, SIDES,
+            MIRROR ? "outer pairs first" :
+                (HIGH_FIRST ? "highest labels first" : "lowest labels first"),
+            shared.thread_count,
             shared.job_count, shared.split_depth,
             workers[0].search.place_goal);
 
@@ -1222,15 +1639,21 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
                     ", nodes=%" PRIu64 " (%.0f/s), bound-prunes=%" PRIu64
-                    ", pair-prunes=%" PRIu64 ", place+pair-fair=%" PRIu64
+                    ", pair-bound-prunes=%" PRIu64
+                    ", pair-prunes=%" PRIu64
+                    ", prefix-place-prunes=%" PRIu64
+                    ", prefix-perm-prunes=%" PRIu64
+                    ", perm-candidates=%" PRIu64
                     ", permutation-fair=%" PRIu64 "\n",
                     hit_limit ? "stopped at limit" : "complete", elapsed,
                     shared.thread_count,
                     atomic_load_explicit(&shared.jobs_done,
                                          memory_order_relaxed),
                     shared.job_count, totals.nodes, nodes_per_second,
-                    totals.bound_prunes, totals.pair_prunes,
-                    totals.place_fair_count,
+                    totals.bound_prunes, totals.pair_bound_prunes,
+                    totals.pair_prunes,
+                    totals.prefix_place_prunes, totals.prefix_perm_prunes,
+                    totals.candidate_count,
                     atomic_load_explicit(&shared.permutation_total,
                                          memory_order_relaxed));
         }
@@ -1244,6 +1667,7 @@ int main(int argc, char **argv)
 cleanup:
     drain_solutions(&shared);
     free(workers);
+    pthread_cond_destroy(&shared.solution_not_full);
     pthread_mutex_destroy(&shared.solution_mutex);
     pthread_cond_destroy(&shared.completion_condition);
     pthread_mutex_destroy(&shared.completion_mutex);

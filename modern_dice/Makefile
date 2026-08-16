@@ -3,8 +3,10 @@ CC ?= cc
 DICE ?= 4
 SIDES ?= 12
 MIRROR ?= 0
+HIGH_FIRST ?= 1
 
-CPPFLAGS += -DDICE=$(DICE) -DSIDES=$(SIDES) -DMIRROR=$(MIRROR)
+CPPFLAGS += -DDICE=$(DICE) -DSIDES=$(SIDES) -DMIRROR=$(MIRROR) \
+	-DHIGH_FIRST=$(HIGH_FIRST)
 CFLAGS ?= -O3 -march=native -flto
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDLIBS += -pthread
