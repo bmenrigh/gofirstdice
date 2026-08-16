@@ -63,6 +63,7 @@
 #endif
 
 #define FACE_COUNT (DICE * SIDES)
+#define PLACE_DIRECTION_COUNT ((DICE * (DICE - 1)) / 2)
 #if MIRROR
 #define SEARCH_COLUMNS (SIDES / 2)
 #else
@@ -80,6 +81,12 @@
 #else
 #define PAIR_BOUND_START (SIDES / 2U)
 #endif
+#endif
+#ifndef LINEAR_BOUND_START
+#define LINEAR_BOUND_START 0U
+#endif
+#ifndef LINEAR_BOUND_STRIDE
+#define LINEAR_BOUND_STRIDE 2U
 #endif
 
 /* Number of permutations and partial permutations, including the empty one. */
@@ -110,6 +117,10 @@
 _Static_assert(SIDES > 0, "SIDES must be positive");
 _Static_assert(PAIR_BOUND_START <= SEARCH_COLUMNS,
                "PAIR_BOUND_START exceeds the searched columns");
+_Static_assert(LINEAR_BOUND_START <= SEARCH_COLUMNS,
+               "LINEAR_BOUND_START exceeds the searched columns");
+_Static_assert(LINEAR_BOUND_STRIDE > 0,
+               "LINEAR_BOUND_STRIDE must be positive");
 _Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
                "permutation state indices must fit in uint16_t");
 
@@ -154,6 +165,10 @@ struct search {
     /* Safe suffix bounds for the die currently being filled. */
     uint64_t minimum_left[DICE][SEARCH_COLUMNS + 1][DICE];
     uint64_t maximum_left[DICE][SEARCH_COLUMNS + 1][DICE];
+    int64_t direction_minimum_left[DICE][SEARCH_COLUMNS + 1]
+                                  [PLACE_DIRECTION_COUNT];
+    int64_t direction_maximum_left[DICE][SEARCH_COLUMNS + 1]
+                                  [PLACE_DIRECTION_COUNT];
 #if PACKED_PAIR_WINS
     /* One byte-wide win counter per previous die, packed into a word. */
     uint64_t pair_wins[DICE];
@@ -167,6 +182,7 @@ struct search {
     uint64_t outcome_count;
     uint64_t place_goal;
     bool permutation_fairness_possible;
+    bool linear_place_bounds_possible;
 
     struct perm_counter permutations;
     struct shared_state *shared;
@@ -174,26 +190,34 @@ struct search {
 
     uint64_t nodes;
     uint64_t bound_prunes;
+    uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
     uint64_t pair_prunes;
     uint64_t prefix_place_prunes;
-    uint64_t prefix_perm_prunes;
-    uint64_t candidate_count;
+    uint64_t all_subset_place_prunes;
+    uint64_t all_subset_place_fair_count;
     uint64_t permutation_fair_count;
 };
 
 struct worker_stats {
     atomic_uint_fast64_t nodes;
     atomic_uint_fast64_t bound_prunes;
+    atomic_uint_fast64_t linear_place_prunes;
     atomic_uint_fast64_t pair_bound_prunes;
     atomic_uint_fast64_t pair_prunes;
     atomic_uint_fast64_t prefix_place_prunes;
-    atomic_uint_fast64_t prefix_perm_prunes;
-    atomic_uint_fast64_t candidate_count;
+    atomic_uint_fast64_t all_subset_place_prunes;
+    atomic_uint_fast64_t all_subset_place_fair_count;
     atomic_uint_fast64_t permutation_fair_count;
 };
 
+enum solution_kind {
+    ALL_SUBSET_PLACE_FAIR,
+    PERMUTATION_FAIR,
+};
+
 struct solution {
+    enum solution_kind kind;
     uint64_t number;
     char encoding[FACE_COUNT + 1];
 };
@@ -207,6 +231,7 @@ struct shared_state {
     atomic_uint_fast64_t next_job;
     atomic_uint_fast64_t jobs_done;
     atomic_uint_fast64_t limit_claims;
+    atomic_uint_fast64_t all_subset_total;
     atomic_uint_fast64_t permutation_total;
     atomic_bool stop;
     atomic_bool internal_error;
@@ -239,12 +264,14 @@ static void usage(FILE *stream, const char *program)
             "Search the compile-time-selected %s%dd%d column-grouped space.\n"
             "The first searched column is fixed to remove equivalent die "
             "renamings.\n"
+            "Results are place-fair for every subset. Fully permutation-fair "
+            "results are reported only in the stronger class.\n"
             "\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
-            "  -n, --limit N       stop after N surviving permutation candidates\n"
+            "  -n, --limit N       stop after N reported results\n"
             "  -p, --progress N    progress interval in seconds; 0 disables\n"
-            "      --print-limit N print at most N permutation-fair solutions\n"
-            "      --all-solutions print every permutation-fair solution\n"
+            "      --print-limit N print at most N of each solution class\n"
+            "      --all-solutions print every solution in both classes\n"
             "  -q, --quiet         print only startup and final counts\n"
             "  -h, --help          show this help\n",
             program, MIRROR ? "mirrored " : "", DICE, SIDES);
@@ -524,15 +551,38 @@ static void build_owner_table(struct search *search)
 }
 
 /* Count one subset's roll orderings by scanning labels from low to high. */
-static bool subset_is_permutation_fair(struct search *search,
-                                       unsigned subset_mask,
-                                       unsigned subset_size)
+static void count_permutation_ways(struct search *search,
+                                   unsigned subset_mask)
 {
     struct perm_counter *counter = &search->permutations;
+    unsigned face;
+
+    memset(counter->ways, 0, sizeof(counter->ways));
+    counter->ways[0] = 1; /* one way to choose an empty ordering */
+
+    for (face = 0; face < FACE_COUNT; ++face) {
+        unsigned owner = search->owner[face];
+        size_t edge;
+
+        if ((subset_mask & (1U << owner)) == 0) {
+            continue;
+        }
+        /* Edges are stored by descending source for safe in-place updates. */
+        for (edge = 0; edge < PERM_EDGE_COUNT; ++edge) {
+            const struct perm_edge *transition = &counter->edge[owner][edge];
+            counter->ways[transition->destination] +=
+            counter->ways[transition->source];
+        }
+    }
+}
+
+static bool counted_subset_is_permutation_fair(
+    const struct search *search, unsigned subset_mask, unsigned subset_size)
+{
+    const struct perm_counter *counter = &search->permutations;
     uint64_t subset_outcomes;
     uint64_t subset_factorial = 1;
     uint64_t goal;
-    unsigned face;
     unsigned i;
 
     if (subset_size > DICE || subset_mask >= (1U << DICE)) {
@@ -549,24 +599,6 @@ static bool subset_is_permutation_fair(struct search *search,
     }
     goal = subset_outcomes / subset_factorial;
 
-    memset(counter->ways, 0, sizeof(counter->ways));
-    counter->ways[0] = 1; /* one way to choose an empty ordering */
-
-    for (face = 0; face < FACE_COUNT; ++face) {
-        unsigned owner = search->owner[face];
-        size_t edge;
-
-        if ((subset_mask & (1U << owner)) == 0) {
-            continue;
-        }
-        /* Edges are stored by descending source for safe in-place updates. */
-        for (edge = 0; edge < PERM_EDGE_COUNT; ++edge) {
-            const struct perm_edge *transition = &counter->edge[owner][edge];
-            counter->ways[transition->destination] +=
-                counter->ways[transition->source];
-        }
-    }
-
     {
         size_t state;
         for (state = counter->length_begin[subset_size];
@@ -580,12 +612,77 @@ static bool subset_is_permutation_fair(struct search *search,
     return true;
 }
 
-static bool check_permutation_fairness(struct search *search)
+static unsigned mask_size(unsigned mask)
 {
-    if (!search->permutation_fairness_possible) {
-        return false;
+    unsigned size = 0;
+
+    while (mask != 0) {
+        size += mask & 1U;
+        mask >>= 1U;
     }
-    return subset_is_permutation_fair(search, (1U << DICE) - 1U, DICE);
+    return size;
+}
+
+/*
+ * The full DP also contains every ordering count for every proper subset.
+ * Sum those ordering buckets by rank to test all subset place marginals.
+ * Full-set place fairness and every pair have already been established.
+ */
+static bool counted_all_subsets_are_place_fair(const struct search *search)
+{
+    uint64_t place_tally[1U << DICE][DICE][DICE] = {{{0}}};
+    uint64_t goal_by_size[DICE + 1] = {0};
+    const struct perm_counter *counter = &search->permutations;
+    unsigned size;
+    size_t state;
+    unsigned mask;
+
+    for (size = 3; size < DICE; ++size) {
+        uint64_t outcomes;
+
+        if (!integer_power(SIDES, size, &outcomes) || outcomes % size != 0) {
+            return false;
+        }
+        goal_by_size[size] = outcomes / size;
+    }
+
+    for (state = 0; state < PERM_STATE_COUNT; ++state) {
+        const struct perm_state *permutation = &counter->state[state];
+        uint64_t count;
+        unsigned position;
+
+        if (permutation->length < 3U || permutation->length >= DICE) {
+            continue;
+        }
+        count = counter->ways[state];
+        for (position = 0; position < permutation->length; ++position) {
+            unsigned die = (unsigned)(
+                (permutation->key >> (4U * position)) & UINT64_C(0xf)) - 1U;
+            place_tally[permutation->mask][die][position] += count;
+        }
+    }
+
+    for (mask = 1; mask < (1U << DICE) - 1U; ++mask) {
+        unsigned die;
+
+        size = mask_size(mask);
+        if (size < 3U || size >= DICE) {
+            continue;
+        }
+        for (die = 0; die < DICE; ++die) {
+            unsigned place;
+
+            if ((mask & (1U << die)) == 0) {
+                continue;
+            }
+            for (place = 0; place < size; ++place) {
+                if (place_tally[mask][die][place] != goal_by_size[size]) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static void initialize_grid(struct search *search)
@@ -688,6 +785,53 @@ static void build_bounds(struct search *search, unsigned row)
         }
     }
 
+    if (search->linear_place_bounds_possible) {
+        unsigned first;
+        unsigned direction = 0;
+
+        for (first = 0; first < DICE; ++first) {
+            unsigned second;
+
+            for (second = first + 1U; second < DICE; ++second) {
+                int column;
+
+                search->direction_minimum_left[row][SEARCH_COLUMNS]
+                                              [direction] = 0;
+                search->direction_maximum_left[row][SEARCH_COLUMNS]
+                                              [direction] = 0;
+                for (column = SEARCH_COLUMNS - 1; column >= 0; --column) {
+                    int64_t minimum = INT64_MAX;
+                    int64_t maximum = INT64_MIN;
+                    unsigned candidate_limit =
+                        column == 0 ? row + 1U : DICE;
+                    unsigned candidate;
+
+                    for (candidate = row; candidate < candidate_limit;
+                         ++candidate) {
+                        int64_t value = (int64_t)choice_contribution(
+                            search, candidate, (unsigned)column, first) -
+                            (int64_t)choice_contribution(
+                                search, candidate, (unsigned)column, second);
+
+                        if (value < minimum) {
+                            minimum = value;
+                        }
+                        if (value > maximum) {
+                            maximum = value;
+                        }
+                    }
+                    search->direction_minimum_left[row][column][direction] =
+                        minimum + search->direction_minimum_left
+                            [row][column + 1][direction];
+                    search->direction_maximum_left[row][column][direction] =
+                        maximum + search->direction_maximum_left
+                            [row][column + 1][direction];
+                }
+                ++direction;
+            }
+        }
+    }
+
 #if PACKED_PAIR_WINS
     {
         uint64_t lane_ones = 0;
@@ -745,6 +889,50 @@ static bool bounds_allow_goal(const struct search *search,
         if (search->minimum_left[row][column][place] > needed ||
             search->maximum_left[row][column][place] < needed) {
             return false;
+        }
+    }
+    return true;
+}
+
+static bool direction_bounds_allow_goal(const struct search *search,
+                                        unsigned row, unsigned column)
+{
+    unsigned first;
+    unsigned direction = 0;
+
+    if (!search->linear_place_bounds_possible) {
+        return true;
+    }
+    /* Coordinate bounds already require exact tallies at the terminal node. */
+    if (column == SEARCH_COLUMNS) {
+        return true;
+    }
+#if LINEAR_BOUND_START != 0
+    if (column < LINEAR_BOUND_START) {
+        return true;
+    }
+#endif
+#if LINEAR_BOUND_STRIDE != 1
+    if (column % LINEAR_BOUND_STRIDE != 0) {
+        return true;
+    }
+#endif
+    for (first = 0; first < DICE; ++first) {
+        unsigned second;
+
+        for (second = first + 1U; second < DICE; ++second) {
+            int64_t current = (int64_t)search->tally[row][first] -
+                              (int64_t)search->tally[row][second];
+
+            if (current +
+                    search->direction_minimum_left[row][column][direction] >
+                    0 ||
+                current +
+                    search->direction_maximum_left[row][column][direction] <
+                    0) {
+                return false;
+            }
+            ++direction;
         }
     }
     return true;
@@ -888,8 +1076,8 @@ static bool die_is_pairwise_fair(const struct search *search, unsigned die)
 }
 
 /*
- * A permutation-fair prefix must first be place-fair as a standalone dice
- * set.  This cheaper test counts ranks by scanning labels from low to high.
+ * Every completed prefix is one of the subsets that must be place-fair.
+ * Count its ranks directly by scanning labels from low to high.
  */
 static bool completed_prefix_is_place_fair(const struct search *search,
                                            unsigned dice_built)
@@ -959,19 +1147,6 @@ static bool completed_prefix_is_place_fair(const struct search *search,
     return true;
 }
 
-/* Every prefix subset of a permutation-fair set must itself be fair. */
-static bool completed_prefix_is_permutation_fair(struct search *search,
-                                                 unsigned dice_built)
-{
-    unsigned subset_mask;
-
-    if (dice_built < 3U) {
-        return true;
-    }
-    subset_mask = (1U << dice_built) - 1U;
-    return subset_is_permutation_fair(search, subset_mask, dice_built);
-}
-
 static double monotonic_seconds(void)
 {
     struct timespec now;
@@ -989,6 +1164,9 @@ static void publish_worker_stats(struct search *search)
                           memory_order_relaxed);
     atomic_store_explicit(&search->published->bound_prunes,
                           search->bound_prunes, memory_order_relaxed);
+    atomic_store_explicit(&search->published->linear_place_prunes,
+                          search->linear_place_prunes,
+                          memory_order_relaxed);
     atomic_store_explicit(&search->published->pair_bound_prunes,
                           search->pair_bound_prunes,
                           memory_order_relaxed);
@@ -997,25 +1175,29 @@ static void publish_worker_stats(struct search *search)
     atomic_store_explicit(&search->published->prefix_place_prunes,
                           search->prefix_place_prunes,
                           memory_order_relaxed);
-    atomic_store_explicit(&search->published->prefix_perm_prunes,
-                          search->prefix_perm_prunes,
+    atomic_store_explicit(&search->published->all_subset_place_prunes,
+                          search->all_subset_place_prunes,
                           memory_order_relaxed);
-    atomic_store_explicit(&search->published->candidate_count,
-                          search->candidate_count, memory_order_relaxed);
+    atomic_store_explicit(
+        &search->published->all_subset_place_fair_count,
+        search->all_subset_place_fair_count, memory_order_relaxed);
     atomic_store_explicit(&search->published->permutation_fair_count,
                           search->permutation_fair_count,
                           memory_order_relaxed);
 }
 
-static void record_solution(struct search *search)
+static void record_solution(struct search *search, enum solution_kind kind)
 {
     struct shared_state *shared = search->shared;
+    atomic_uint_fast64_t *total = kind == ALL_SUBSET_PLACE_FAIR
+        ? &shared->all_subset_total
+        : &shared->permutation_total;
     uint64_t number;
     unsigned face;
     bool enqueued = false;
 
     pthread_mutex_lock(&shared->solution_mutex);
-    number = atomic_fetch_add_explicit(&shared->permutation_total, 1,
+    number = atomic_fetch_add_explicit(total, 1,
                                        memory_order_relaxed) + 1U;
     if (number <= shared->options.print_limit) {
         struct solution *solution;
@@ -1025,6 +1207,7 @@ static void record_solution(struct search *search)
                               &shared->solution_mutex);
         }
         solution = &shared->solution_queue[shared->solution_tail];
+        solution->kind = kind;
         solution->number = number;
         for (face = 0; face < FACE_COUNT; ++face) {
             solution->encoding[face] =
@@ -1058,6 +1241,17 @@ static void accept_configuration(struct search *search)
         return;
     }
 
+    build_owner_table(search);
+    count_permutation_ways(search, (1U << DICE) - 1U);
+    if (!counted_all_subsets_are_place_fair(search)) {
+        ++search->all_subset_place_prunes;
+        return;
+    }
+
+    permutation_fair = search->permutation_fairness_possible &&
+        counted_subset_is_permutation_fair(
+            search, (1U << DICE) - 1U, DICE);
+
     if (shared->options.limit != 0) {
         limit_claim = atomic_fetch_add_explicit(&shared->limit_claims, 1,
                                                 memory_order_relaxed);
@@ -1067,12 +1261,12 @@ static void accept_configuration(struct search *search)
         }
     }
 
-    ++search->candidate_count;
-    build_owner_table(search);
-    permutation_fair = check_permutation_fairness(search);
     if (permutation_fair) {
         ++search->permutation_fair_count;
-        record_solution(search);
+        record_solution(search, PERMUTATION_FAIR);
+    } else {
+        ++search->all_subset_place_fair_count;
+        record_solution(search, ALL_SUBSET_PLACE_FAIR);
     }
 
     if (shared->options.limit != 0 &&
@@ -1209,6 +1403,10 @@ static void search_row(struct search *search, unsigned row, unsigned column)
         ++search->bound_prunes;
         return;
     }
+    if (!direction_bounds_allow_goal(search, row, column)) {
+        ++search->linear_place_prunes;
+        return;
+    }
     if (!pair_bounds_allow_goal(search, row, column)) {
         ++search->pair_bound_prunes;
         return;
@@ -1233,10 +1431,6 @@ static void search_row(struct search *search, unsigned row, unsigned column)
         }
         if (!completed_prefix_is_place_fair(search, row + 1U)) {
             ++search->prefix_place_prunes;
-            return;
-        }
-        if (!completed_prefix_is_permutation_fair(search, row + 1U)) {
-            ++search->prefix_perm_prunes;
             return;
         }
         if (row + 1U < DICE - 1U) {
@@ -1277,6 +1471,8 @@ static bool initialize_search(struct search *search)
     search->place_goal = search->outcome_count / DICE;
     search->permutation_fairness_possible =
         search->outcome_count % DICE_FACTORIAL == 0;
+    search->linear_place_bounds_possible =
+        search->outcome_count <= (uint64_t)INT64_MAX;
 
     initialize_grid(search);
     if (!build_contributions(search)) {
@@ -1293,11 +1489,12 @@ static bool initialize_search(struct search *search)
 struct totals {
     uint64_t nodes;
     uint64_t bound_prunes;
+    uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
     uint64_t pair_prunes;
     uint64_t prefix_place_prunes;
-    uint64_t prefix_perm_prunes;
-    uint64_t candidate_count;
+    uint64_t all_subset_place_prunes;
+    uint64_t all_subset_place_fair_count;
     uint64_t permutation_fair_count;
 };
 
@@ -1312,16 +1509,20 @@ static struct totals collect_totals(const struct worker *workers,
                                              memory_order_relaxed);
         totals.bound_prunes += atomic_load_explicit(
             &workers[i].stats.bound_prunes, memory_order_relaxed);
+        totals.linear_place_prunes += atomic_load_explicit(
+            &workers[i].stats.linear_place_prunes, memory_order_relaxed);
         totals.pair_bound_prunes += atomic_load_explicit(
             &workers[i].stats.pair_bound_prunes, memory_order_relaxed);
         totals.pair_prunes += atomic_load_explicit(
             &workers[i].stats.pair_prunes, memory_order_relaxed);
         totals.prefix_place_prunes += atomic_load_explicit(
             &workers[i].stats.prefix_place_prunes, memory_order_relaxed);
-        totals.prefix_perm_prunes += atomic_load_explicit(
-            &workers[i].stats.prefix_perm_prunes, memory_order_relaxed);
-        totals.candidate_count += atomic_load_explicit(
-            &workers[i].stats.candidate_count, memory_order_relaxed);
+        totals.all_subset_place_prunes += atomic_load_explicit(
+            &workers[i].stats.all_subset_place_prunes,
+            memory_order_relaxed);
+        totals.all_subset_place_fair_count += atomic_load_explicit(
+            &workers[i].stats.all_subset_place_fair_count,
+            memory_order_relaxed);
         totals.permutation_fair_count += atomic_load_explicit(
             &workers[i].stats.permutation_fair_count, memory_order_relaxed);
     }
@@ -1406,7 +1607,10 @@ static void drain_solutions(struct shared_state *shared)
         if (!have_solution) {
             break;
         }
-        printf("permutation-fair #%" PRIu64 " encoding=%s\n",
+        printf("%s #%" PRIu64 " encoding=%s\n",
+               solution.kind == ALL_SUBSET_PLACE_FAIR
+                   ? "all-subset-place-fair"
+                   : "permutation-fair",
                solution.number, solution.encoding);
     }
     fflush(stdout);
@@ -1423,17 +1627,20 @@ static void print_progress(const struct shared_state *shared,
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
             " nodes=%" PRIu64 " pruned=%" PRIu64
+            " linear-place-pruned=%" PRIu64
             " pair-bound-pruned=%" PRIu64 " pair-pruned=%" PRIu64
             " prefix-place-pruned=%" PRIu64
-            " prefix-perm-pruned=%" PRIu64
-            " perm-candidates=%" PRIu64
+            " all-subset-place-pruned=%" PRIu64
+            " all-subset-place-fair=%" PRIu64
             " permutation-fair=%" PRIu64 "\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
             shared->job_count, totals.nodes, totals.bound_prunes,
-            totals.pair_bound_prunes, totals.pair_prunes,
+            totals.linear_place_prunes, totals.pair_bound_prunes,
+            totals.pair_prunes,
             totals.prefix_place_prunes,
-            totals.prefix_perm_prunes,
-            totals.candidate_count,
+            totals.all_subset_place_prunes,
+            atomic_load_explicit(&shared->all_subset_total,
+                                 memory_order_relaxed),
             atomic_load_explicit(&shared->permutation_total,
                                  memory_order_relaxed));
     fflush(stderr);
@@ -1471,12 +1678,16 @@ static void watch_workers(struct shared_state *shared,
         drain_solutions(shared);
         if (!suppression_reported && shared->options.print_limit != 0 &&
             shared->options.print_limit != UINT64_MAX &&
-            atomic_load_explicit(&shared->permutation_total,
-                                 memory_order_relaxed) >
-                shared->options.print_limit) {
+            (atomic_load_explicit(&shared->all_subset_total,
+                                  memory_order_relaxed) >
+                 shared->options.print_limit ||
+             atomic_load_explicit(&shared->permutation_total,
+                                  memory_order_relaxed) >
+                 shared->options.print_limit)) {
             fprintf(stderr,
-                    "Solution output suppressed after %" PRIu64
-                    " results; use --all-solutions for the complete stream.\n",
+                    "Solution output limited to the first %" PRIu64
+                    " results in each class; use --all-solutions for the "
+                    "complete streams.\n",
                     shared->options.print_limit);
             suppression_reported = true;
         }
@@ -1533,6 +1744,7 @@ int main(int argc, char **argv)
     atomic_init(&shared.next_job, 0);
     atomic_init(&shared.jobs_done, 0);
     atomic_init(&shared.limit_claims, 0);
+    atomic_init(&shared.all_subset_total, 0);
     atomic_init(&shared.permutation_total, 0);
     atomic_init(&shared.stop, false);
     atomic_init(&shared.internal_error, false);
@@ -1564,11 +1776,12 @@ int main(int argc, char **argv)
         workers[i].search.published = &workers[i].stats;
         atomic_init(&workers[i].stats.nodes, 0);
         atomic_init(&workers[i].stats.bound_prunes, 0);
+        atomic_init(&workers[i].stats.linear_place_prunes, 0);
         atomic_init(&workers[i].stats.pair_bound_prunes, 0);
         atomic_init(&workers[i].stats.pair_prunes, 0);
         atomic_init(&workers[i].stats.prefix_place_prunes, 0);
-        atomic_init(&workers[i].stats.prefix_perm_prunes, 0);
-        atomic_init(&workers[i].stats.candidate_count, 0);
+        atomic_init(&workers[i].stats.all_subset_place_prunes, 0);
+        atomic_init(&workers[i].stats.all_subset_place_fair_count, 0);
         atomic_init(&workers[i].stats.permutation_fair_count, 0);
     }
 
@@ -1639,21 +1852,25 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
                     ", nodes=%" PRIu64 " (%.0f/s), bound-prunes=%" PRIu64
+                    ", linear-place-prunes=%" PRIu64
                     ", pair-bound-prunes=%" PRIu64
                     ", pair-prunes=%" PRIu64
                     ", prefix-place-prunes=%" PRIu64
-                    ", prefix-perm-prunes=%" PRIu64
-                    ", perm-candidates=%" PRIu64
+                    ", all-subset-place-prunes=%" PRIu64
+                    ", all-subset-place-fair=%" PRIu64
                     ", permutation-fair=%" PRIu64 "\n",
                     hit_limit ? "stopped at limit" : "complete", elapsed,
                     shared.thread_count,
                     atomic_load_explicit(&shared.jobs_done,
                                          memory_order_relaxed),
                     shared.job_count, totals.nodes, nodes_per_second,
-                    totals.bound_prunes, totals.pair_bound_prunes,
+                    totals.bound_prunes, totals.linear_place_prunes,
+                    totals.pair_bound_prunes,
                     totals.pair_prunes,
-                    totals.prefix_place_prunes, totals.prefix_perm_prunes,
-                    totals.candidate_count,
+                    totals.prefix_place_prunes,
+                    totals.all_subset_place_prunes,
+                    atomic_load_explicit(&shared.all_subset_total,
+                                         memory_order_relaxed),
                     atomic_load_explicit(&shared.permutation_total,
                                          memory_order_relaxed));
         }
