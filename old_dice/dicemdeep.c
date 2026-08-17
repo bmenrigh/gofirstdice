@@ -19,7 +19,7 @@
 #include "rc4_16.h"
 #include "pavl.h"
 
-#define MAXTHREADS 4
+#define MAXTHREADS 8
 #define FORKDEPTH  3
 #define DOFORK     1
 #define SEMSKIP    4096
@@ -240,7 +240,7 @@ void sum_find(int (*)[DICE][SIDES], uint64_t (*)[DICE][DICE], int);
 void sum_find_row(int (*)[DICE][SIDES], uint64_t (*)[DICE][DICE], int, int,
 		  uint64_t *);
 void sum_find_row_mir(int (*)[DICE][SIDES], uint64_t (*)[DICE][DICE],
-		      int, int, int (*)[DICE][SIDES], int, 
+		      int, int, int (*)[DICE][SIDES], int,
 		      uint64_t (*)[DICE][SIDES][DICE],
 		      uint64_t (*)[DICE][SIDES][DICE]);
 void sum_find_perm(int (*)[DICE][SIDES], uint64_t (*)[DICE][DICE],
@@ -276,7 +276,7 @@ int main(void) {
   uint64_t sum_tries;
 
   char gstr[(DICE * SIDES) + 1];
-  
+
   struct datum d;
 
   /* use unitialized stack memory */
@@ -333,7 +333,7 @@ int main(void) {
   /*for (i = 0; i < 100; i++) {
     printf("%d\n", getnum(SIDES, SIDESMASK));
     }*/
-  
+
 
 
   /* setup the perm tree */
@@ -395,7 +395,7 @@ int main(void) {
   print_all_perms(&all_perms);
   memset(&all_perms, 0, sizeof(all_perms));*/
 
-    
+
   /*print_grid(&grid); */
 
   /* mutate our grid for the hell of it */
@@ -431,7 +431,7 @@ int main(void) {
 
   grid_to_string(&grid, &gstr);
   /* printf("%s\n", gstr); */
-  
+
   memset(&tscore, 0, sizeof(tscore));
   sum_tries = 0;
   /*sum_find(&grid, &tscore, 0);*/
@@ -508,7 +508,7 @@ void climb() {
   if (locale == NULL) {
     return;
   }
-  
+
   fprintf(stderr, "The close factor (%f) score is %'ld\n", CLOSEFACTOR,
 	  (long)CLOSESCORE);
 
@@ -516,7 +516,7 @@ void climb() {
   last_good = 0;
   mut_limit = ((SIDES * DICE) / 2);
   while (1 == 1) {
-    
+
     /* We'll fork here */
     if ((DOFORK == 1) && (MAXTHREADS > 0) && (child == 0)) {
       /* we're about to make a child */
@@ -536,7 +536,7 @@ void climb() {
       }
       else {
 	threadid += 1; /* The next child will get this number */
-      
+
 	while (children >= MAXTHREADS) {
 	  wait(&status);
 	  children--;
@@ -545,7 +545,7 @@ void climb() {
       }
     } /* end if do fork */
 
-    
+
 
     if (threadid != 0) {
       rp = getnum(POP_SIZE, POP_MASK);
@@ -566,7 +566,7 @@ void climb() {
 
       ri = (ri + 1) % POP_SIZE;
     }
-      
+
 
     /* do the systematic mutations if they haven't been done yet */
     if (d.brute == 0) {
@@ -584,7 +584,7 @@ void climb() {
 
 	    count_all_perms(&(d_tmp.grid), &all_perms);
 	    d_tmp.score = score_all_perms(&all_perms, &linear);
-      
+
 	    if (d_tmp.score == 0) {
 	      acquire_write_lock();
 	      printf("[child %d] Got set that is fair for all places\n",
@@ -592,13 +592,13 @@ void climb() {
 	      print_grid(&(d_tmp.grid));
 	      release_write_lock();
 	    }
-      
+
 	    if (d_tmp.score < local_worst) {
 	      if (climb_try_add(&d_tmp, -1, linear, &local_worst) == 1) {
 		last_good = 0;
 	      }
 	    }
-	    
+
 	    /* now do the second-level brute */
 	    for (c2 = c1; c2 < lim; c2++) {
 	      for (r21 = 0; r21 < (DICE - 1); r21++) {
@@ -613,7 +613,7 @@ void climb() {
 
 		  count_all_perms(&(d_tmp2.grid), &all_perms);
 		  d_tmp2.score = score_all_perms(&all_perms, &linear);
-      
+
 		  if (d_tmp2.score == 0) {
 		    acquire_write_lock();
 		    printf("[child %d] Got set that is fair for all places\n",
@@ -621,7 +621,7 @@ void climb() {
 		    print_grid(&(d_tmp2.grid));
 		    release_write_lock();
 		  }
-      
+
 		  if (d_tmp2.score < local_worst) {
 		    if (climb_try_add(&d_tmp2, -2, linear, &local_worst) == 1) {
 		      last_good = 0;
@@ -646,7 +646,7 @@ void climb() {
 
 			count_all_perms(&(d_tmp3.grid), &all_perms);
 			d_tmp3.score = score_all_perms(&all_perms, &linear);
-      
+
 			if (d_tmp3.score == 0) {
 			  acquire_write_lock();
 			  printf("[child %d] Got set that is fair for all places\n",
@@ -654,7 +654,7 @@ void climb() {
 			  print_grid(&(d_tmp3.grid));
 			  release_write_lock();
 			}
-      
+
 			if (d_tmp3.score < local_worst) {
 			  if (climb_try_add(&d_tmp3, -3, linear, & local_worst) == 1) {
 			    last_good = 0;
@@ -689,7 +689,7 @@ void climb() {
     else {
       mut_limit = DICE * 2;
     }
-    
+
     mutate(&(d.grid));
     mutate(&(d.grid));
     mutate(&(d.grid));
@@ -698,7 +698,7 @@ void climb() {
 
       if (MIRRORSYM == 0) {
 	rm = getnum(2, 1);
-	
+
 	if (rm == 0) {
 	  mutate(&(d.grid));
 	}
@@ -715,7 +715,7 @@ void climb() {
 	d.score = score_tallies(&tallies, &linear);*/
       count_all_perms(&(d.grid), &all_perms);
       d.score = score_all_perms(&all_perms, &linear);
-      
+
       if (d.score == 0) {
 	acquire_write_lock();
 	printf("[child %d] Got set that is fair for all places\n",
@@ -723,15 +723,15 @@ void climb() {
 	print_grid(&(d.grid));
 	release_write_lock();
       }
-      
+
       if (d.score < local_worst) {
 	if (climb_try_add(&d, i + 1 + 3, linear, &local_worst) == 1) {
 	  last_good = 0;
 	}
       }
     }
-    
-    
+
+
     last_good++;
   }
 
@@ -776,7 +776,7 @@ void distribute(int (*g)[DICE][SIDES], int depth) {
       /*if (is_fair(g, SIDES) == 1) { */
       /*printf("Got preliminary fair:\n");
 	print_grid(g);*/
-      
+
       /* Just check the first two, first */
       /*memset(&tallies, 0, sizeof(tallies));
       count_perms(g, 0, &selection, &tallies, 2);
@@ -916,36 +916,36 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
   if (depth >= (SIDES)) {
 
     t_count_pl_fair += 1;
-      
+
     if (t_count_pl_fair >= SEMSKIP) {
       semwait(0, __LINE__);
       shmdata->count_pl_fair += t_count_pl_fair;
-      
+
       if (shmdata->count_pl_fair >= shmdata->goal_count) {
 	fprintf(stderr, "[child %d] Place-fair count so far: %lu\n",
 		threadid, shmdata->count_pl_fair);
-	
+
 	shmdata->goal_count *= 2;
       }
       /*print_tallies(t);*/
       t_count_pl_fair = 0;
       t_best_pr_score = shmdata->best_pr_score;
-      
+
       semsignal(0, __LINE__);
     }
-    
+
     /*fprintf(stderr, "%lu\n", count);*/
-    
+
     memset(&selection, 0, sizeof(selection));
     memset(&permtallies, 0, sizeof(permtallies));
     memset(&tallies, 0, sizeof(tallies));
-    
+
     fast_count_perms(g, &permtallies);
-    
+
     /*count_perms(g, 0, &selection,
       &tallies, &permtallies);*/
     pr_score = score_perms(&permtallies);
-    
+
     if (pr_score < t_best_pr_score) {
       semwait(0, __LINE__);
       if (pr_score < shmdata->best_pr_score) {
@@ -953,33 +953,33 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
 		threadid, pr_score);
 	print_perms(&permtallies);
 	shmdata->best_pr_score = pr_score;
-	
+
       }
-      
+
       t_best_pr_score = shmdata->best_pr_score;
-      
+
       fflush(stdout);
       semsignal(0, __LINE__);
     }
 
     if (pr_score == 0) {
-      
+
       /* aquire lock */
-      
+
       semwait(0, __LINE__);
       shmdata->count_pr_fair += 1;
-      
+
       /*score = score_tallies(t, &linear);
 	fprintf(stderr, "Score: %'ld / %'ld\n", (long)score, (long)linear);*/
       print_grid(g);
       /*print_tallies(t);*/
       /*fprintf(stderr, "\n");*/
       /*fast_count_perms_print(g);*/
-      
+
       fflush(stdout);
       /* release lock */
       semsignal(0, __LINE__);
-      
+
     }
     else {
       /*fprintf(stderr, "Perms were bad...\n");
@@ -1025,7 +1025,7 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
       t_cache[depth][d][pl] = (*t)[d][pl] +
 	tallie_cache[g_cache[depth][d][depth]][pl];
       if (MIRRORSYM == 1) {
-	t_cache[depth][d][pl] += 
+	t_cache[depth][d][pl] +=
 	  tallie_cache[((DICE * SIDES) - 1) -
 		       g_cache[depth][d][depth]][pl];
       }
@@ -1043,7 +1043,7 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
 	  t_cache[depth][d][pl] = (*t)[d][pl] +
 	    tallie_cache[g_cache[depth][d][depth]][pl];
 	  if (MIRRORSYM == 1) {
-	    t_cache[depth][d][pl] += 
+	    t_cache[depth][d][pl] +=
 	      tallie_cache[((DICE * SIDES) - 1) -
 			   g_cache[depth][d][depth]][pl];
 	  }
@@ -1051,14 +1051,14 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
       }
       sum_find(&(g_cache[depth]), &(t_cache[depth]), depth + 1);
     }
-    
+
     /* compute new tallie */
     for (d = 0; d < DICE; d++) {
       for (pl = 0; pl < DICE; pl++) {
 	t_cache[depth][d][pl] = (*t)[d][pl] +
 	  tallie_cache[g_cache[depth][d][depth]][pl];
 	if (MIRRORSYM == 1) {
-	  t_cache[depth][d][pl] += 
+	  t_cache[depth][d][pl] +=
 	    tallie_cache[((DICE * SIDES) - 1) -
 			 g_cache[depth][d][depth]][pl];
 	}
@@ -1075,14 +1075,14 @@ void sum_find(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE], int depth) {
     if (shmdata->count_pl_fair >= shmdata->goal_count) {
       fprintf(stderr, "[child %d] (sum_find) Place-fair count so far: %lu\n",
 	      threadid, shmdata->count_pl_fair);
-	  
+
       shmdata->goal_count *= 2;
     }
     /*print_tallies(t);*/
     t_count_pl_fair = 0;
     t_best_pr_score = shmdata->best_pr_score;
 
-    fprintf(stderr, "[child %d] Exiting...\n", threadid);	
+    fprintf(stderr, "[child %d] Exiting...\n", threadid);
     semsignal(0, __LINE__);
 
     exit(0); /* now go away */
@@ -1119,7 +1119,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 		       row, 0, &un_mir);
   }
 
-  
+
   if (((MIRRORSYM == 0) && (depth < SIDES)) ||
       ((MIRRORSYM == 1) && (depth < (SIDES / 2)))) {
     for (pl = 0; pl < DICE; pl++) {
@@ -1135,7 +1135,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
     }
   }
-  
+
   /* fork the shit out of this problem */
   if ((DOFORK == 1) && (row == 0) && (depth == FORKDEPTH) &&
       (MAXTHREADS > 0)) {
@@ -1186,7 +1186,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
     }
 
-    
+
     if (row == (DICE - 1)) {
 
       t_count_pl_fair += 1;
@@ -1194,12 +1194,12 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       /* Report weakly-place-fair */
       semwait(0, __LINE__);
       /* print_grid(g); */
-      grid_to_string(g, &gstr);
-      printf("%s\n", gstr);
+      /*grid_to_string(g, &gstr);*/
+      /*printf("%s\n", gstr);*/
       fflush(stdout);
       semsignal(0, __LINE__);
-	
-      
+
+
       if (t_count_pl_fair >= SEMSKIP) {
 	semwait(0, __LINE__);
 	shmdata->count_pl_fair += t_count_pl_fair;
@@ -1208,16 +1208,16 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 	  fprintf(stderr, "[child %d] (sum_find_row) "
 		  "Place-fair count so far: %lu\n",
 		  threadid, shmdata->count_pl_fair);
-	  
+
 	  shmdata->goal_count *= 2;
 	}
 	/*print_tallies(t);*/
 	t_count_pl_fair = 0;
 	t_best_pr_score = shmdata->best_pr_score;
-	
+
 	semsignal(0, __LINE__);
       }
-      
+
       /*fprintf(stderr, "%lu\n", count);*/
 
       memset(&selection, 0, sizeof(selection));
@@ -1225,7 +1225,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       memset(&tallies, 0, sizeof(tallies));
 
       fast_count_perms(g, &permtallies);
-	
+
       /*count_perms(g, 0, &selection,
 	&tallies, &permtallies);*/
       pr_score = score_perms(&permtallies);
@@ -1237,7 +1237,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 		  threadid, pr_score);
 	  print_perms(&permtallies);
 	  shmdata->best_pr_score = pr_score;
-	  
+
 	}
 
 	t_best_pr_score = shmdata->best_pr_score;
@@ -1247,7 +1247,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
 
       if (pr_score == 0) {
-	
+
 	/* aquire lock */
 
 	semwait(0, __LINE__);
@@ -1255,7 +1255,9 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 
 	/*score = score_tallies(t, &linear);
 	  fprintf(stderr, "Score: %'ld / %'ld\n", (long)score, (long)linear);*/
-	print_grid(g);
+	/*print_grid(g);*/
+	grid_to_string(g, &gstr);
+	printf("%s\n", gstr);
 	/*print_tallies(t);*/
 	/*fprintf(stderr, "\n");*/
 	/*fast_count_perms_print(g);*/
@@ -1296,7 +1298,7 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       g_cache_row[row][depth][row][depth] =
 	((DICE * SIDES) - 1) - (*g)[row][(SIDES / 2) -
 					 ((depth - (SIDES / 2)) + 1)];
-      
+
       memcpy(&(t_cache_row[row][depth]), t, sizeof(tallies));
       /* compute new tallie */
       /*for (pl = 0; pl < DICE; pl++) {
@@ -1327,12 +1329,12 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
     }
     if (MIRRORSYM == 1) {
       for (pl = 0; pl < DICE; pl++) {
-	t_cache_row[row][depth][row][pl] += 
+	t_cache_row[row][depth][row][pl] +=
 	  tallie_cache[((DICE * SIDES) - 1) -
 		       g_cache_row[row][depth][row][depth]][pl];
       }
     }
-    
+
     sum_find_row(&(g_cache_row[row][depth]), &(t_cache_row[row][depth]),
 		 row, depth + 1, c);
 
@@ -1351,14 +1353,14 @@ void sum_find_row(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       fprintf(stderr, "[child %d] (sum_find_row) "
 	      "Place-fair count so far: %lu\n",
 	      threadid, shmdata->count_pl_fair);
-	  
+
       shmdata->goal_count *= 2;
     }
     /*print_tallies(t);*/
     t_count_pl_fair = 0;
     t_best_pr_score = shmdata->best_pr_score;
 
-    fprintf(stderr, "[child %d] Exiting...\n", threadid);	
+    fprintf(stderr, "[child %d] Exiting...\n", threadid);
     semsignal(0, __LINE__);
 
     exit(0); /* now go away */
@@ -1395,7 +1397,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 	   sizeof(max_tallie_left));
   }
 
-  
+
   if (depth < SIDES) {
     for (pl = 0; pl < DICE; pl++) {
       if ((*t)[row][pl] + max_tallie_left_cache[row][depth][row][depth][pl] <
@@ -1412,7 +1414,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
     }
   }
-  
+
   /* fork the shit out of this problem */
   if ((DOFORK == 1) && (row == 0) && (depth == FORKDEPTH) &&
       (MAXTHREADS > 0)) {
@@ -1439,7 +1441,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
   if (depth >= (SIDES)) {
     /*print_grid(g);
       return;*/
-    
+
     /* make sure this dice adds right */
     for (pl = 0; pl < DICE; pl++) {
       if ((*t)[row][pl] != GOALTALLY) {
@@ -1454,11 +1456,11 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
     }
 
-    
+
     if (row == (DICE - 1)) {
 
       t_count_pl_fair += 1;
-      
+
       if (t_count_pl_fair >= SEMSKIP) {
 	semwait(0, __LINE__);
 	shmdata->count_pl_fair += t_count_pl_fair;
@@ -1466,16 +1468,16 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 	if (shmdata->count_pl_fair >= shmdata->goal_count) {
 	  fprintf(stderr, "[child %d] Place-fair count so far: %lu\n",
 		  threadid, shmdata->count_pl_fair);
-	  
+
 	  shmdata->goal_count *= 2;
 	}
 	/*print_tallies(t);*/
 	t_count_pl_fair = 0;
 	t_best_pr_score = shmdata->best_pr_score;
-	
+
 	semsignal(0, __LINE__);
       }
-      
+
       /*fprintf(stderr, "%lu\n", count);*/
 
       memset(&selection, 0, sizeof(selection));
@@ -1483,7 +1485,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       memset(&tallies, 0, sizeof(tallies));
 
       fast_count_perms(g, &permtallies);
-	
+
       /*count_perms(g, 0, &selection,
 	&tallies, &permtallies);*/
       pr_score = score_perms(&permtallies);
@@ -1495,7 +1497,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 		  threadid, pr_score);
 	  print_perms(&permtallies);
 	  shmdata->best_pr_score = pr_score;
-	  
+
 	}
 
 	t_best_pr_score = shmdata->best_pr_score;
@@ -1505,7 +1507,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       }
 
       if (pr_score == 0) {
-	
+
 	/* aquire lock */
 
 	semwait(0, __LINE__);
@@ -1600,7 +1602,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
     }
 
     if ((MIRRORSYM == 1) && (c < MAXUNMIRROR) && (depth < (SIDES / 2)))  {
-      
+
       /* unmirror */
       un_mir_cache[row][depth][row][depth] = 1;
       un_mir_cache[row][depth][row][(SIDES - 1) - depth] = 1;
@@ -1638,12 +1640,12 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       for (d2 = row; d2 < DICE; d2++) {
 	if ((*g)[d2][(SIDES - 1) - depth] ==
 	    ((DICE * SIDES) - 1) - g_cache_row[row][depth][row][depth]) {
-	  
+
 	  g_cache_row[row][depth][row][(SIDES - 1) - depth] =
 	    (*g)[d2][(SIDES - 1) - depth];
 	  g_cache_row[row][depth][d2][(SIDES - 1) - depth] =
 	    (*g)[row][(SIDES - 1) - depth];
-	  
+
 	  found = 1;
 	  break;
 	}
@@ -1655,7 +1657,7 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 
       /* and add in the mirror tallies */
       for (pl = 0; pl < DICE; pl++) {
-	t_cache_row[row][depth][row][pl] += 
+	t_cache_row[row][depth][row][pl] +=
 	  tallie_cache[g_cache_row[row][depth][row][(SIDES - 1) - depth]][pl];
       }
     }
@@ -1680,14 +1682,14 @@ void sum_find_row_mir(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
     if (shmdata->count_pl_fair >= shmdata->goal_count) {
       fprintf(stderr, "[child %d] Place-fair count so far: %lu\n",
 	      threadid, shmdata->count_pl_fair);
-	  
+
       shmdata->goal_count *= 2;
     }
     /*print_tallies(t);*/
     t_count_pl_fair = 0;
     t_best_pr_score = shmdata->best_pr_score;
 
-    fprintf(stderr, "[child %d] Exiting...\n", threadid);	
+    fprintf(stderr, "[child %d] Exiting...\n", threadid);
     semsignal(0, __LINE__);
 
     exit(0); /* now go away */
@@ -1737,7 +1739,7 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       count_all_perms_re(g, p, i);
     }
   }
-  
+
 
   /* Perm pruning */
   if (depth >= MINPERMDEPTH) {
@@ -1748,9 +1750,9 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       /*pc = npr(DICE, plen);*/
       pc = p_max_index[plen];
       pgoal = ((uint64_t)pow(SIDES, plen)) / npr(plen, plen);
-      
+
       for (i = 0; i < pc; i++) {
-	
+
 	/*if (((*p)[plen][i] + (min_perm[plen][SIDES - 1] -
 	  min_perm[plen][depth - 1])) > pgoal) {*/
 	if (all_perms_min[plen][i] > pgoal) {
@@ -1794,7 +1796,7 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
   if (depth >= (SIDES)) {
 
     t_count_pl_fair += 1;
-      
+
     if (t_count_pl_fair >= SEMSKIP) {
       semwait(0, __LINE__);
       shmdata->count_pl_fair += t_count_pl_fair;
@@ -1802,27 +1804,27 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       if (shmdata->count_pl_fair >= shmdata->goal_count) {
 	fprintf(stderr, "[child %d] Place-fair count so far: %lu\n",
 		threadid, shmdata->count_pl_fair);
-	
+
 	shmdata->goal_count *= 2;
       }
       /*print_tallies(t);*/
       t_count_pl_fair = 0;
       t_best_pr_score = shmdata->best_pr_score;
-      
+
       semsignal(0, __LINE__);
     }
-    
+
     /*fprintf(stderr, "%lu\n", count);*/
-    
+
     /*memset(&selection, 0, sizeof(selection));
     memset(&permtallies, 0, sizeof(permtallies));
     memset(&tallies, 0, sizeof(tallies));*/
     /*fast_count_perms(g, &permtallies);*/
-    
+
     /*count_perms(g, 0, &selection,
       &tallies, &permtallies);*/
     pr_score = score_all_perms(p, &linear);
-    
+
     if (pr_score < t_best_pr_score) {
       semwait(0, __LINE__);
       if (pr_score < shmdata->best_pr_score) {
@@ -1830,33 +1832,33 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 		threadid, pr_score);
 	print_perms(&permtallies);
 	shmdata->best_pr_score = pr_score;
-	
+
       }
-      
+
       t_best_pr_score = shmdata->best_pr_score;
-      
+
       fflush(stdout);
       semsignal(0, __LINE__);
     }
 
     if (pr_score == 0) {
-      
+
       /* aquire lock */
-      
+
       semwait(0, __LINE__);
       shmdata->count_pr_fair += 1;
-      
+
       /*score = score_tallies(t, &linear);
 	fprintf(stderr, "Score: %'ld / %'ld\n", (long)score, (long)linear);*/
       print_grid(g);
       /*print_tallies(t);*/
       /*fprintf(stderr, "\n");*/
       /*fast_count_perms_print(g);*/
-      
+
       fflush(stdout);
       /* release lock */
       semsignal(0, __LINE__);
-      
+
     }
     else {
       /*fprintf(stderr, "Perms were bad...\n");
@@ -1908,7 +1910,7 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
       t_cache[depth][d][pl] = (*t)[d][pl] +
 	tallie_cache[g_cache[depth][d][depth]][pl];
       if (MIRRORSYM == 1) {
-	t_cache[depth][d][pl] += 
+	t_cache[depth][d][pl] +=
 	  tallie_cache[((DICE * SIDES) - 1) -
 		       g_cache[depth][d][depth]][pl];
       }
@@ -1920,7 +1922,7 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
     memcpy(&(p_cache[depth]), p, sizeof(all_perms));
     count_all_perms_re(&(g_cache[depth]), &(p_cache[depth]), depth);
   }
-    
+
   sum_find_perm(&(g_cache[depth]), &(t_cache[depth]),
 		&(p_cache[depth]), depth + 1);
 
@@ -1933,7 +1935,7 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 	  t_cache[depth][d][pl] = (*t)[d][pl] +
 	    tallie_cache[g_cache[depth][d][depth]][pl];
 	  if (MIRRORSYM == 1) {
-	    t_cache[depth][d][pl] += 
+	    t_cache[depth][d][pl] +=
 	      tallie_cache[((DICE * SIDES) - 1) -
 			   g_cache[depth][d][depth]][pl];
 	  }
@@ -1945,18 +1947,18 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
 	memcpy(&(p_cache[depth]), p, sizeof(all_perms));
 	count_all_perms_re(&(g_cache[depth]), &(p_cache[depth]), depth);
       }
-	
+
       sum_find_perm(&(g_cache[depth]), &(t_cache[depth]),
 		    &(p_cache[depth]), depth + 1);
     }
-    
+
     /* compute new tallie */
     for (d = 0; d < DICE; d++) {
       for (pl = 0; pl < DICE; pl++) {
 	t_cache[depth][d][pl] = (*t)[d][pl] +
 	  tallie_cache[g_cache[depth][d][depth]][pl];
 	if (MIRRORSYM == 1) {
-	  t_cache[depth][d][pl] += 
+	  t_cache[depth][d][pl] +=
 	    tallie_cache[((DICE * SIDES) - 1) -
 			 g_cache[depth][d][depth]][pl];
 	}
@@ -1981,14 +1983,14 @@ void sum_find_perm(int (*g)[DICE][SIDES], uint64_t (*t)[DICE][DICE],
     if (shmdata->count_pl_fair >= shmdata->goal_count) {
       fprintf(stderr, "[child %d] Place-fair count so far: %lu\n",
 	      threadid, shmdata->count_pl_fair);
-	  
+
       shmdata->goal_count *= 2;
     }
     /*print_tallies(t);*/
     t_count_pl_fair = 0;
     t_best_pr_score = shmdata->best_pr_score;
 
-    fprintf(stderr, "[child %d] Exiting...\n", threadid);	
+    fprintf(stderr, "[child %d] Exiting...\n", threadid);
     semsignal(0, __LINE__);
 
     exit(0); /* now go away */
@@ -2028,7 +2030,7 @@ void fill_columns4(int (*g)[DICE][SIDES], int depth) {
     /* Set the mirror column */
     (*g)[i][SIDES - (depth + 1)] =
       (DICE * SIDES) - ((*g)[i][depth] + 1);
- 
+
     /* Set the next column too */
     (*g)[i][depth + 1] = ((DICE * (depth + 2)) - 1) -
       ((*g)[i][depth] % DICE);
@@ -2090,7 +2092,7 @@ void count_perms(int (*g)[DICE][SIDES], int depth,
     }
 
     pidx = permindex(&perm);
-      
+
     /* Add one to this perm bucket */
     (*p)[pidx] += 1;
 
@@ -2207,7 +2209,7 @@ int check_tallies(uint64_t (*t)[DICE][DICE], int d) {
     }
     p += 1;
   }
- 
+
   return p;
 }
 
@@ -2222,7 +2224,7 @@ int check_perms(uint64_t (*p)[DICEFACT]) {
       return 0;
     }
   }
- 
+
   return 1;
 }
 
@@ -2242,7 +2244,7 @@ int score_perms(uint64_t (*p)[DICEFACT]) {
 
     s += t;
   }
- 
+
   return s;
 }
 
@@ -2276,7 +2278,7 @@ int score_all_perms(uint64_t (*p)[DICE + 1][DICEFACT], uint64_t *linear) {
       }
     }
   }
- 
+
   return s;
 }
 
@@ -2291,7 +2293,7 @@ uint64_t score_tallies(uint64_t (*t)[DICE][DICE], uint64_t *linear) {
   *linear = 0;
   for (i = 0; i < DICE; i++) {
     for (j = 0; j < DICE; j++) {
-      
+
       d = (((*t)[j][i] - GOALTALLY));
 
       if (d < 0) {
@@ -2300,10 +2302,10 @@ uint64_t score_tallies(uint64_t (*t)[DICE][DICE], uint64_t *linear) {
 
       s += (d * d);
       *linear += d;
-	   
+
     }
   }
- 
+
   return s;
 }
 
@@ -2332,7 +2334,7 @@ void print_perms(uint64_t (*p)[DICEFACT]) {
 
   for (i = 0; i < DICEFACT; i++) {
     fprintf(stderr, "%-7ld ", (*p)[i]);
-    
+
     if ((i + 1) % (DICE * 2) == 0) {
       fprintf(stderr, "\n");
     }
@@ -2353,7 +2355,7 @@ void print_all_perms(uint64_t (*p)[DICE + 1][DICEFACT]) {
 
     for (i = 0; i < p_max_index[n]; i++) {
       fprintf(stderr, "%-7ld ", (*p)[n][i]);
-    
+
       if ((i + 1) % (DICE * 2) == 0) {
 	fprintf(stderr, "\n");
       }
@@ -2437,7 +2439,7 @@ int add_pop(struct datum *d, int index) {
 
       memcpy(&(shmdata->population[index]), d, sizeof(struct datum));
       (shmdata->population[index]).brute = 0;
- 
+
       return 1;
     }
   } else {
@@ -2692,9 +2694,9 @@ void build_tallie_table_math() {
 
   for (s = 0; s < SIDES; s++) {
     for (d = 0; d < DICE; d++) {
-     
+
       v = (s * DICE) + d;
-      
+
       /* Now figure out for each place, starting with first */
       for (p = 0; p < DICE; p++) {
 	/* to be in 1st place (0th) there needs to be DICE - 1 numbers
@@ -2717,7 +2719,7 @@ void build_tallie_table_math() {
 	     (uint64_t)pow(s, ((DICE - d) - 1) - (p - ab)));
 	}
 
-	/*fprintf(stderr, "n=%d, p=%d, c=%ld\n", (s * DICE) + d, p, tallie_cache[v][p]);*/
+	fprintf(stderr, "n=%d, p=%d, c=%ld\n", (s * DICE) + d, p, tallie_cache[v][p]);
       }
     }
   }
@@ -2784,7 +2786,7 @@ void build_tallies_left(int (*g)[DICE][SIDES],
 	  else {
 	    t += tallie_cache[((DICE * SIDES) - 1) - v][p];
 	  }
-	}  
+	}
 
 	if (t < min) {
 	  min = t;
@@ -2807,7 +2809,7 @@ void build_tallies_left(int (*g)[DICE][SIDES],
 	(*maxt)[rows][s][p] = max + (*maxt)[rows][s + 1][p];
       }
       /*fprintf(stderr, "Bringing min,max for s=%d; p=%d to %lu, %lu\n",
-	s, p, min_tallie_left[rows][s][p], max_tallie_left[rows][s][p]);*/
+	s, p, min_tallie_left[rows][s][p], max_tallie_left[rows][s][p]); */
 
     } /* end for s */
   }
@@ -2903,13 +2905,13 @@ void fast_count_perms(int (*g)[DICE][SIDES], uint64_t (*p)[DICEFACT]) {
 	    t.count = 0;
 	    t.perm[t.amt + 1] = d;
 	    t.amt += 1;
-	   
+
 	    /* Now stick it in or find this perm in the tree */
 	    tp = insert_or_find_pnode(perm_tree, &t);
 
 	    /* The only thing to do now is to add this count */
 	    tp->count += pnode_last->count;
-	  }	    
+	  }
 
 	  /* Move on */
 	  /*fprintf(stderr, "about to move on\n");*/
@@ -3080,13 +3082,13 @@ void fast_count_perms_print(int (*g)[DICE][SIDES]) {
 	    t.count = 0;
 	    t.perm[t.amt + 1] = d;
 	    t.amt += 1;
-	   
+
 	    /* Now stick it in or find this perm in the tree */
 	    tp = insert_or_find_pnode(perm_tree, &t);
 
 	    /* The only thing to do now is to add this count */
 	    tp->count += pnode_last->count;
-	  }	    
+	  }
 
 	  /* Move on */
 	  /*fprintf(stderr, "about to move on\n");*/
@@ -3115,8 +3117,8 @@ void fast_count_perms_print(int (*g)[DICE][SIDES]) {
 	/* reset this for next time */
 	pnode_last->count = 0;
       }
-      
-      
+
+
       /* Move on */
       pnode_last = pnode_cur;
       pnode_cur = (struct perm_node *)pavl_t_next(&traverser);
@@ -3181,13 +3183,13 @@ void count_all_perms(int (*g)[DICE][SIDES],
 	    t.count = 0;
 	    t.perm[t.amt + 1] = d;
 	    t.amt += 1;
-	   
+
 	    /* Now stick it in or find this perm in the tree */
 	    tp = insert_or_find_pnode(perm_tree, &t);
 
 	    /* The only thing to do now is to add this count */
 	    tp->count += pnode_last->count;
-	  }	    
+	  }
 
 	  /* Move on */
 	  /*fprintf(stderr, "about to move on\n");*/
@@ -3269,7 +3271,7 @@ int climb_try_add(struct datum *d, int m, uint64_t linear, uint64_t *worst) {
     goto unlock_and_continue;
   }
   added = 1;
-	
+
   new_worst = worst_pop_score();
 
   if (d->score < shmdata->best_score) {
@@ -3282,7 +3284,7 @@ int climb_try_add(struct datum *d, int m, uint64_t linear, uint64_t *worst) {
     /*print_grid(&(d->grid));*/
     /*print_tallies(&tallies);*/
     print_all_perms(&all_perms);
-    
+
   }
   if (new_worst < shmdata->worst_score) {
     shmdata->worst_score = new_worst;
@@ -3330,15 +3332,15 @@ void build_perm_stuff() {
        * this dice, d, in it, we need to add it onto the end
        */
       pavl_t_init(&traverser, perm_tree_re);
-      
+
       pnode_last = (struct perm_node_re *)pavl_t_next(&traverser);
       pnode_cur = (struct perm_node_re *)pavl_t_next(&traverser);
       while (pnode_last != NULL) {
-	
+
 
 
 	/*fprintf(stderr, "in loop\n");*/
-	
+
 	has_d = 0;
 	if (pnode_last->amt < DICE) {
 	  for (i = 0; i <= pnode_last->amt; i++) {
@@ -3348,18 +3350,18 @@ void build_perm_stuff() {
 	    }
 	  }
 	}
-	
-	
+
+
 	if (has_d == 0) {
 	  /*fprintf(stderr, "doesn't have d\n");*/
 	  /* We found a perm we need to put d onto the end of */
 	  memcpy(&t, pnode_last, sizeof(struct perm_node_re));
 	  t.perm[t.amt + 1] = d;
 	  t.amt += 1;
-	  
+
 	  /* Now stick it in or find this perm in the tree */
 	  tp = insert_or_find_pnode_re(perm_tree_re, &t);
-	  
+
 	  /* Add this count */
 	  lall_perms[t.amt + 1][tp->index] +=
 	    lall_perms[t.amt][pnode_last->index];
@@ -3370,8 +3372,8 @@ void build_perm_stuff() {
 
 	  /* Record the index pointer */
 	  perm_index_ptr[t.amt + 1][tp->index] = pnode_last->index;
-	}	    
-	
+	}
+
 	/* Move on */
 	/*fprintf(stderr, "about to move on\n");*/
 	pnode_last = pnode_cur;
@@ -3436,13 +3438,13 @@ void count_all_perms_re(int (*g)[DICE][SIDES],
 	 * this dice, d, in it, we need to add it onto the end
 	 */
 	pavl_t_init(&traverser, perm_tree_re);
-      
+
 	pnode_last = (struct perm_node_re *)pavl_t_next(&traverser);
 	pnode_cur = (struct perm_node_re *)pavl_t_next(&traverser);
 	while (pnode_last != NULL) {
-	  
+
 	  /*fprintf(stderr, "in loop\n");*/
-	  
+
 	  has_d = 0;
 	  if (pnode_last->amt < DICE) {
 	    for (i = 0; i <= pnode_last->amt; i++) {
@@ -3452,23 +3454,23 @@ void count_all_perms_re(int (*g)[DICE][SIDES],
 	      }
 	    }
 	  }
-	  
-	  
+
+
 	  if (has_d == 0) {
 	    /*fprintf(stderr, "doesn't have d\n");*/
 	    /* We found a perm we need to put d onto the end of */
 	    memcpy(&t, pnode_last, sizeof(struct perm_node_re));
 	    t.perm[t.amt + 1] = d;
 	    t.amt += 1;
-	    
+
 	    /* Now stick it in or find this perm in the tree */
 	    tp = insert_or_find_pnode_re(perm_tree_re, &t);
-	    
+
 	    /* The only thing to do now is to add this count */
 	    (*p)[t.amt + 1][tp->index] +=
 	      (*p)[t.amt][pnode_last->index];
-	  }	    
-	  
+	  }
+
 	  /* Move on */
 	  /*fprintf(stderr, "about to move on\n");*/
 	  pnode_last = pnode_cur;
@@ -3532,7 +3534,7 @@ struct perm_node_re * insert_or_find_pnode_re(struct pavl_table *t,
 
   if (*pnode_probe == pnode_copy) {
     /* Just inserted, gotta set an index */
-    
+
     (*pnode_probe)->index = p_max_index[(*pnode_probe)->amt + 1];
     p_max_index[(*pnode_probe)->amt + 1] += 1;
 
