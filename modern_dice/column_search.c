@@ -17,6 +17,7 @@
  */
 
 #include <errno.h>
+#include <ctype.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
@@ -96,6 +97,7 @@
 #define JOBS_PER_WORKER UINT64_C(8)
 #define MAX_THREADS 256U
 #define SOLUTION_QUEUE_CAPACITY 256U
+#define TEMPLATE_UNASSIGNED UINT8_MAX
 #ifndef PAIR_BOUND_START
 #if PACKED_PAIR_WINS
 #define PAIR_BOUND_START 0U
@@ -179,8 +181,12 @@ struct options {
     uint64_t print_limit;
     uint64_t progress_seconds;
     unsigned threads;
+    const char *template_path;
+    uint8_t template_value[DICE][SIDES];
+    unsigned template_lock_count;
     bool random_order;
     bool seed_given;
+    bool template_active;
     bool quiet;
 };
 
@@ -245,6 +251,15 @@ struct search {
     /* Face labels are zero based internally. */
     unsigned grid[DICE][SIDES];
     unsigned owner[FACE_COUNT];
+
+    /* Internal build order may differ from the user-facing A, B, ... order. */
+    unsigned logical_die[DICE];
+    bool fixed_cell[DICE][SEARCH_COLUMNS];
+    unsigned fixed_row_count[DICE];
+    unsigned fixed_column_count[SEARCH_COLUMNS];
+    unsigned candidate_mask[DICE][SEARCH_COLUMNS];
+    bool template_active;
+    bool template_possible;
 
     /* Recursion-depth to physical-column mapping, planned once per row. */
     unsigned column_order[DICE][SEARCH_COLUMNS];
@@ -329,6 +344,8 @@ struct solution {
 struct shared_state {
     struct options options;
     unsigned thread_count;
+    unsigned start_row;
+    unsigned prefix_columns;
     unsigned split_depth;
     uint64_t job_count;
     uint64_t prefix_count;
@@ -402,8 +419,8 @@ static void usage(FILE *stream, const char *program)
             "Usage: %s [OPTIONS]\n"
             "\n"
             "Search the compile-time-selected %s%dd%d column-grouped space.\n"
-            "The first searched column is fixed to remove equivalent die "
-            "renamings.\n"
+            "Without a template, the first searched column removes equivalent "
+            "die renamings.\n"
 #if PERM_ONLY
             "This build searches only for permutation-fair results and uses "
             "incremental prefix-permutation bounds.\n"
@@ -414,6 +431,11 @@ static void usage(FILE *stream, const char *program)
             "\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
             "  -j, --jobs N        logical jobs; default is chosen automatically\n"
+            "      --template FILE lock selected die/column assignments\n"
+            "                      first row may start '0 1 ...' or 'columns:';\n"
+            "                      it must list 0 through %d exactly, in order;\n"
+            "                      rows use 'A:' plus exactly SIDES entries;\n"
+            "                      values are offsets, with '.' or 'x' free\n"
             "      --random-order shuffle jobs before starting workers\n"
             "      --seed N        random-order seed; requires --random-order\n"
 #if PERM_ONLY
@@ -431,7 +453,7 @@ static void usage(FILE *stream, const char *program)
 #endif
             "  -q, --quiet         print only startup and final counts\n"
             "  -h, --help          show this help\n",
-            program, MIRROR ? "mirrored " : "", DICE, SIDES);
+            program, MIRROR ? "mirrored " : "", DICE, SIDES, SIDES - 1);
 }
 
 static bool parse_uint64(const char *text, uint64_t *value)
@@ -451,6 +473,265 @@ static bool parse_uint64(const char *text, uint64_t *value)
     return true;
 }
 
+static bool template_keyword_is(const char *text, const char *keyword)
+{
+    while (*keyword != '\0') {
+        if (tolower((unsigned char)*text) !=
+            tolower((unsigned char)*keyword)) {
+            return false;
+        }
+        ++text;
+        ++keyword;
+    }
+    return *text == ':' || isspace((unsigned char)*text);
+}
+
+static bool parse_template_column_header(const struct options *options,
+                                         char *cursor,
+                                         unsigned line_number)
+{
+    unsigned column;
+
+    for (column = 0; column < SIDES; ++column) {
+        char *end;
+        unsigned long value;
+
+        while (isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0' || *cursor == '#') {
+            fprintf(stderr,
+                    "%s:%u: column header has %u values; this build "
+                    "requires exactly %d.\n",
+                    options->template_path, line_number, column, SIDES);
+            return false;
+        }
+        if (!isdigit((unsigned char)*cursor)) {
+            fprintf(stderr,
+                    "%s:%u: column header entry %u must be %u.\n",
+                    options->template_path, line_number, column, column);
+            return false;
+        }
+        errno = 0;
+        value = strtoul(cursor, &end, 10);
+        if (errno != 0 || end == cursor || value != column ||
+            (*end != '\0' && *end != '#' &&
+             !isspace((unsigned char)*end))) {
+            fprintf(stderr,
+                    "%s:%u: column header entry %u must be %u.\n",
+                    options->template_path, line_number, column, column);
+            return false;
+        }
+        cursor = end;
+    }
+    while (isspace((unsigned char)*cursor)) {
+        ++cursor;
+    }
+    if (*cursor != '\0' && *cursor != '#') {
+        fprintf(stderr,
+                "%s:%u: column header has more than %d values.\n",
+                options->template_path, line_number, SIDES);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_template_file(struct options *options)
+{
+    FILE *file = fopen(options->template_path, "r");
+    char *line = NULL;
+    size_t capacity = 0;
+    unsigned line_number = 0;
+    bool seen[DICE] = {false};
+    bool saw_column_header = false;
+    bool saw_die_row = false;
+    bool valid = true;
+
+    if (file == NULL) {
+        fprintf(stderr, "Unable to open template '%s': %s\n",
+                options->template_path, strerror(errno));
+        return false;
+    }
+    while (getline(&line, &capacity, file) >= 0) {
+        char *cursor = line;
+        unsigned logical_die;
+        unsigned column;
+
+        ++line_number;
+        while (isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (*cursor == '\0' || *cursor == '#') {
+            continue;
+        }
+        if (template_keyword_is(cursor, "columns") ||
+            isdigit((unsigned char)*cursor)) {
+            bool named_header = template_keyword_is(cursor, "columns");
+
+            if (saw_column_header || saw_die_row) {
+                fprintf(stderr,
+                        "%s:%u: the column header must appear once, before "
+                        "all die rows.\n",
+                        options->template_path, line_number);
+                valid = false;
+                break;
+            }
+            if (named_header) {
+                cursor += sizeof("columns") - 1U;
+                while (isspace((unsigned char)*cursor)) {
+                    ++cursor;
+                }
+                if (*cursor != ':') {
+                    fprintf(stderr,
+                            "%s:%u: expected ':' after 'columns'.\n",
+                            options->template_path, line_number);
+                    valid = false;
+                    break;
+                }
+                ++cursor;
+            }
+            if (!parse_template_column_header(options, cursor,
+                                              line_number)) {
+                valid = false;
+                break;
+            }
+            saw_column_header = true;
+            continue;
+        }
+        if (isalpha((unsigned char)*cursor)) {
+            int label = toupper((unsigned char)*cursor);
+
+            logical_die = (unsigned)(label - 'A');
+        } else {
+            logical_die = DICE;
+        }
+        ++cursor;
+        while (isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (logical_die >= DICE || *cursor != ':') {
+            fprintf(stderr,
+                    "%s:%u: expected a die label from A through %c followed "
+                    "by ':'.\n",
+                    options->template_path, line_number, 'A' + DICE - 1);
+            valid = false;
+            break;
+        }
+        saw_die_row = true;
+        if (seen[logical_die]) {
+            fprintf(stderr, "%s:%u: die %c appears more than once.\n",
+                    options->template_path, line_number,
+                    'A' + logical_die);
+            valid = false;
+            break;
+        }
+        seen[logical_die] = true;
+        ++cursor;
+
+        for (column = 0; column < SIDES; ++column) {
+            char *end;
+            unsigned long value;
+
+            while (isspace((unsigned char)*cursor)) {
+                ++cursor;
+            }
+            if (*cursor == '\0' || *cursor == '#') {
+                fprintf(stderr,
+                        "%s:%u: die %c has %u values; this build requires "
+                        "exactly %d.\n",
+                        options->template_path, line_number,
+                        'A' + logical_die, column, SIDES);
+                valid = false;
+                break;
+            }
+            if ((*cursor == '.' || *cursor == 'x' || *cursor == 'X') &&
+                (cursor[1] == '\0' || cursor[1] == '#' ||
+                 isspace((unsigned char)cursor[1]))) {
+                ++cursor;
+                continue;
+            }
+            errno = 0;
+            value = strtoul(cursor, &end, 10);
+            if (errno != 0 || end == cursor || value >= DICE ||
+                (*end != '\0' && *end != '#' &&
+                 !isspace((unsigned char)*end))) {
+                fprintf(stderr,
+                        "%s:%u: column %u must be '.', 'x', or a value from "
+                        "0 through %d.\n",
+                        options->template_path, line_number, column,
+                        DICE - 1);
+                valid = false;
+                break;
+            }
+            options->template_value[logical_die][column] = (uint8_t)value;
+            ++options->template_lock_count;
+            cursor = end;
+        }
+        if (!valid) {
+            break;
+        }
+        while (isspace((unsigned char)*cursor)) {
+            ++cursor;
+        }
+        if (*cursor != '\0' && *cursor != '#') {
+            fprintf(stderr,
+                    "%s:%u: die %c has more than %d values.\n",
+                    options->template_path, line_number,
+                    'A' + logical_die, SIDES);
+            valid = false;
+            break;
+        }
+    }
+    if (ferror(file)) {
+        fprintf(stderr, "Unable to read template '%s': %s\n",
+                options->template_path, strerror(errno));
+        valid = false;
+    }
+    free(line);
+    if (fclose(file) != 0 && valid) {
+        fprintf(stderr, "Unable to close template '%s': %s\n",
+                options->template_path, strerror(errno));
+        valid = false;
+    }
+    if (!valid) {
+        return false;
+    }
+
+    {
+        unsigned column;
+
+        for (column = 0; column < SIDES; ++column) {
+            unsigned used = 0;
+            unsigned die;
+
+            for (die = 0; die < DICE; ++die) {
+                uint8_t value = options->template_value[die][column];
+                unsigned bit;
+
+                if (value == TEMPLATE_UNASSIGNED) {
+                    continue;
+                }
+                bit = 1U << value;
+                if ((used & bit) != 0) {
+                    fprintf(stderr,
+                            "%s: column %u assigns value %u to more than "
+                            "one die.\n",
+                            options->template_path, column, value);
+                    return false;
+                }
+                used |= bit;
+            }
+        }
+    }
+    if (options->template_lock_count == 0) {
+        fprintf(stderr, "Template '%s' contains no fixed assignments.\n",
+                options->template_path);
+        return false;
+    }
+    options->template_active = true;
+    return true;
+}
+
 static bool parse_options(int argc, char **argv, struct options *options)
 {
     int i;
@@ -459,6 +740,8 @@ static bool parse_options(int argc, char **argv, struct options *options)
         .print_limit = DEFAULT_PRINT_LIMIT,
         .progress_seconds = DEFAULT_PROGRESS_SECONDS,
     };
+    memset(options->template_value, TEMPLATE_UNASSIGNED,
+           sizeof(options->template_value));
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(stdout, argv[0]);
@@ -493,6 +776,14 @@ static bool parse_options(int argc, char **argv, struct options *options)
         }
         if (strcmp(argv[i], "--random-order") == 0) {
             options->random_order = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--template") == 0) {
+            if (++i >= argc || options->template_path != NULL) {
+                fprintf(stderr, "--template requires one template file.\n");
+                return false;
+            }
+            options->template_path = argv[i];
             continue;
         }
         if (strcmp(argv[i], "--seed") == 0) {
@@ -534,6 +825,9 @@ static bool parse_options(int argc, char **argv, struct options *options)
     }
     if (options->seed_given && !options->random_order) {
         fprintf(stderr, "--seed requires --random-order.\n");
+        return false;
+    }
+    if (options->template_path != NULL && !parse_template_file(options)) {
         return false;
     }
     return true;
@@ -936,6 +1230,8 @@ static bool counted_all_subsets_are_place_fair(const struct search *search)
 }
 #endif
 
+static unsigned physical_column(unsigned search_column);
+
 static void initialize_grid(struct search *search)
 {
     unsigned column;
@@ -965,6 +1261,127 @@ static void initialize_grid(struct search *search)
 #endif
 }
 
+static bool configure_template(struct search *search,
+                               const struct options *options)
+{
+    uint8_t fixed_value[DICE][SEARCH_COLUMNS];
+    unsigned logical_count[DICE] = {0};
+    unsigned logical;
+    unsigned column;
+
+    memset(fixed_value, TEMPLATE_UNASSIGNED, sizeof(fixed_value));
+    search->template_active = options->template_active;
+    search->template_possible = true;
+    for (logical = 0; logical < DICE; ++logical) {
+        search->logical_die[logical] = logical;
+    }
+    if (!options->template_active) {
+        initialize_grid(search);
+        return true;
+    }
+
+    for (logical = 0; logical < DICE; ++logical) {
+        for (column = 0; column < SEARCH_COLUMNS; ++column) {
+            unsigned actual_column = physical_column(column);
+            uint8_t value = options->template_value[logical][actual_column];
+
+#if MIRROR
+            unsigned mirror_column = SIDES - actual_column - 1U;
+            uint8_t mirror_value =
+                options->template_value[logical][mirror_column];
+
+            if (mirror_value != TEMPLATE_UNASSIGNED) {
+                uint8_t implied = (uint8_t)(DICE - 1U - mirror_value);
+
+                if (value != TEMPLATE_UNASSIGNED && value != implied) {
+                    fprintf(stderr,
+                            "Template columns %u and %u conflict for die "
+                            "%c in mirrored mode.\n",
+                            actual_column, mirror_column, 'A' + logical);
+                    return false;
+                }
+                value = implied;
+            }
+#endif
+            fixed_value[logical][actual_column] = value;
+            if (value != TEMPLATE_UNASSIGNED) {
+                ++logical_count[logical];
+            }
+        }
+    }
+
+    /* Most constrained named dice become the earliest internal search rows. */
+    for (logical = 1; logical < DICE; ++logical) {
+        unsigned selected = search->logical_die[logical];
+        unsigned position = logical;
+
+        while (position > 0U &&
+               logical_count[search->logical_die[position - 1U]] <
+                   logical_count[selected]) {
+            search->logical_die[position] =
+                search->logical_die[position - 1U];
+            --position;
+        }
+        search->logical_die[position] = selected;
+    }
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = physical_column(column);
+        unsigned used = 0;
+        unsigned row;
+
+        for (row = 0; row < DICE; ++row) {
+            unsigned named_die = search->logical_die[row];
+            uint8_t value = fixed_value[named_die][actual_column];
+
+            if (value == TEMPLATE_UNASSIGNED) {
+                continue;
+            }
+            if ((used & (1U << value)) != 0) {
+                fprintf(stderr,
+                        "Template column %u assigns value %u to conflicting "
+                        "mirrored constraints.\n",
+                        actual_column, value);
+                return false;
+            }
+            used |= 1U << value;
+            search->fixed_cell[row][actual_column] = true;
+            ++search->fixed_row_count[row];
+            ++search->fixed_column_count[actual_column];
+            search->grid[row][actual_column] =
+                actual_column * DICE + value;
+#if MIRROR
+            search->grid[row][SIDES - actual_column - 1U] =
+                FACE_COUNT - search->grid[row][actual_column] - 1U;
+#endif
+        }
+        for (row = 0; row < DICE; ++row) {
+            unsigned offset;
+
+            if (search->fixed_cell[row][actual_column]) {
+                continue;
+            }
+            for (offset = 0; offset < DICE; ++offset) {
+                unsigned preferred = (actual_column & 1U) == 0
+                    ? offset
+                    : DICE - offset - 1U;
+
+                if ((used & (1U << preferred)) == 0) {
+                    used |= 1U << preferred;
+                    search->grid[row][actual_column] =
+                        actual_column * DICE + preferred;
+#if MIRROR
+                    search->grid[row][SIDES - actual_column - 1U] =
+                        FACE_COUNT - search->grid[row][actual_column] - 1U;
+#endif
+                    break;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 /* Translate recursion depth to the physical face-label column. */
 static unsigned physical_column(unsigned search_column)
 {
@@ -988,6 +1405,54 @@ static void reset_column_order(struct search *search, unsigned row)
     for (column = 0; column < SEARCH_COLUMNS; ++column) {
         search->column_order[row][column] = physical_column(column);
     }
+    if (search->template_active) {
+        for (column = 1; column < SEARCH_COLUMNS; ++column) {
+            unsigned selected = search->column_order[row][column];
+            unsigned position = column;
+
+            while (position > 0U) {
+                unsigned previous =
+                    search->column_order[row][position - 1U];
+                bool selected_fixed = search->fixed_cell[row][selected];
+                bool previous_fixed = search->fixed_cell[row][previous];
+
+                if (previous_fixed > selected_fixed ||
+                    (previous_fixed == selected_fixed &&
+                     search->fixed_column_count[previous] >=
+                         search->fixed_column_count[selected])) {
+                    break;
+                }
+                search->column_order[row][position] = previous;
+                --position;
+            }
+            search->column_order[row][position] = selected;
+        }
+    }
+}
+
+static unsigned available_candidate_mask(const struct search *search,
+                                         unsigned row,
+                                         unsigned actual_column,
+                                         bool canonical_column)
+{
+    unsigned candidate;
+    unsigned mask = 0;
+
+    if (!search->template_active) {
+        if (canonical_column) {
+            return 1U << row;
+        }
+        return ((1U << DICE) - 1U) & ~((1U << row) - 1U);
+    }
+    if (search->fixed_cell[row][actual_column]) {
+        return 1U << row;
+    }
+    for (candidate = row; candidate < DICE; ++candidate) {
+        if (!search->fixed_cell[candidate][actual_column]) {
+            mask |= 1U << candidate;
+        }
+    }
+    return mask;
 }
 
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
@@ -1206,6 +1671,7 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
     column = SEARCH_COLUMNS;
     while (column-- > 0) {
         unsigned actual_column = ordered_column(search, row, column);
+        unsigned candidate_mask = search->candidate_mask[row][column];
 
         for (permutation = 0; permutation < permutation_count;
              ++permutation) {
@@ -1217,6 +1683,10 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
                 uint64_t contribution = additive_perm_contribution_at(
                     search, bounds, row, candidate, actual_column,
                     permutation);
+
+                if ((candidate_mask & (1U << candidate)) == 0) {
+                    continue;
+                }
                 if (contribution < minimum) {
                     minimum = contribution;
                 }
@@ -1237,7 +1707,8 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
                  ++direction) {
                 unsigned first = bounds->direction_first[row][direction];
                 unsigned second = bounds->direction_second[row][direction];
-                unsigned candidate = row;
+                unsigned candidate =
+                    (unsigned)__builtin_ctz(candidate_mask);
                 int64_t minimum =
                     (int64_t)additive_perm_contribution_at(
                         search, bounds, row, candidate, actual_column,
@@ -1255,6 +1726,10 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
                         (int64_t)additive_perm_contribution_at(
                             search, bounds, row, candidate, actual_column,
                             second);
+
+                    if ((candidate_mask & (1U << candidate)) == 0) {
+                        continue;
+                    }
 
                     if (difference < minimum) {
                         minimum = difference;
@@ -1426,16 +1901,22 @@ static void plan_column_order(struct search *search, unsigned row)
     reset_column_order(search, row);
     for (column = 0; column < SEARCH_COLUMNS; ++column) {
         unsigned actual_column = search->column_order[row][column];
-        unsigned candidate_limit = column == 0 ? row + 1U : DICE;
+        unsigned candidate_mask = available_candidate_mask(
+            search, row, actual_column,
+            !search->template_active && column == 0);
 
         for (place = 0; place < DICE; ++place) {
             uint64_t low = UINT64_MAX;
             uint64_t high = 0;
             unsigned candidate;
 
-            for (candidate = row; candidate < candidate_limit; ++candidate) {
+            for (candidate = row; candidate < DICE; ++candidate) {
                 uint64_t value = choice_contribution_at(
                     search, candidate, actual_column, place);
+
+                if ((candidate_mask & (1U << candidate)) == 0) {
+                    continue;
+                }
 
                 if (value < low) {
                     low = value;
@@ -1462,9 +1943,11 @@ static void plan_column_order(struct search *search, unsigned row)
                 for (column = 0; column < SEARCH_COLUMNS; ++column) {
                     unsigned actual_column =
                         search->column_order[row][column];
-                    unsigned candidate_limit =
-                        column == 0 ? row + 1U : DICE;
-                    unsigned candidate = row;
+                    unsigned candidate_mask = available_candidate_mask(
+                        search, row, actual_column,
+                        !search->template_active && column == 0);
+                    unsigned candidate =
+                        (unsigned)__builtin_ctz(candidate_mask);
                     int64_t low =
                         (int64_t)choice_contribution_at(
                             search, candidate, actual_column, first) -
@@ -1472,12 +1955,15 @@ static void plan_column_order(struct search *search, unsigned row)
                             search, candidate, actual_column, second);
                     int64_t high = low;
 
-                    for (++candidate; candidate < candidate_limit;
-                         ++candidate) {
+                    for (++candidate; candidate < DICE; ++candidate) {
                         int64_t value = (int64_t)choice_contribution_at(
                             search, candidate, actual_column, first) -
                             (int64_t)choice_contribution_at(
                                 search, candidate, actual_column, second);
+
+                        if ((candidate_mask & (1U << candidate)) == 0) {
+                            continue;
+                        }
 
                         if (value < low) {
                             low = value;
@@ -1504,17 +1990,21 @@ static void plan_column_order(struct search *search, unsigned row)
             for (column = 0; column < SEARCH_COLUMNS; ++column) {
                 unsigned actual_column =
                     search->column_order[row][column];
-                unsigned candidate_limit =
-                    column == 0 ? row + 1U : DICE;
+                unsigned candidate_mask = available_candidate_mask(
+                    search, row, actual_column,
+                    !search->template_active && column == 0);
                 unsigned low = 1;
                 unsigned high = 0;
                 unsigned candidate;
 
-                for (candidate = row; candidate < candidate_limit;
-                     ++candidate) {
+                for (candidate = row; candidate < DICE; ++candidate) {
                     unsigned value =
                         search->grid[candidate][actual_column] >
                         search->grid[previous][actual_column];
+
+                    if ((candidate_mask & (1U << candidate)) == 0) {
+                        continue;
+                    }
 
                     if (value < low) {
                         low = value;
@@ -1532,14 +2022,20 @@ static void plan_column_order(struct search *search, unsigned row)
     }
 #endif
 
-    feasible_choices[0] = 1;
-    for (column = 1; column < SEARCH_COLUMNS; ++column) {
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
         unsigned actual_column = search->column_order[row][column];
+        unsigned candidate_mask = available_candidate_mask(
+            search, row, actual_column,
+            !search->template_active && column == 0);
         unsigned feasible = 0;
         unsigned candidate;
 
         for (candidate = row; candidate < DICE; ++candidate) {
             bool allowed = true;
+
+            if ((candidate_mask & (1U << candidate)) == 0) {
+                continue;
+            }
 
             for (place = 0; place < DICE; ++place) {
                 uint64_t value = choice_contribution_at(
@@ -1611,12 +2107,13 @@ static void plan_column_order(struct search *search, unsigned row)
         feasible_choices[column] = feasible;
     }
 
-    for (column = 2; column < SEARCH_COLUMNS; ++column) {
+    for (column = search->template_active ? 1U : 2U;
+         column < SEARCH_COLUMNS; ++column) {
         unsigned selected_column = search->column_order[row][column];
         unsigned selected_choices = feasible_choices[column];
         unsigned position = column;
 
-        while (position > 1U &&
+        while (position > (search->template_active ? 0U : 1U) &&
                feasible_choices[position - 1U] > selected_choices) {
             search->column_order[row][position] =
                 search->column_order[row][position - 1U];
@@ -1625,6 +2122,13 @@ static void plan_column_order(struct search *search, unsigned row)
         }
         search->column_order[row][position] = selected_column;
         feasible_choices[position] = selected_choices;
+    }
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = search->column_order[row][column];
+
+        search->candidate_mask[row][column] = available_candidate_mask(
+            search, row, actual_column,
+            !search->template_active && column == 0);
     }
 }
 
@@ -1642,11 +2146,16 @@ static void build_bounds(struct search *search, unsigned row)
             uint64_t minimum = UINT64_MAX;
             uint64_t maximum = 0;
             unsigned candidate;
-            unsigned candidate_limit = column == 0 ? row + 1U : DICE;
+            unsigned candidate_mask =
+                search->candidate_mask[row][(unsigned)column];
 
-            for (candidate = row; candidate < candidate_limit; ++candidate) {
+            for (candidate = row; candidate < DICE; ++candidate) {
                 uint64_t value = choice_contribution(
                     search, row, candidate, (unsigned)column, place);
+
+                if ((candidate_mask & (1U << candidate)) == 0) {
+                    continue;
+                }
                 if (value < minimum) {
                     minimum = value;
                 }
@@ -1676,19 +2185,27 @@ static void build_bounds(struct search *search, unsigned row)
                 search->direction_maximum_left[row][SEARCH_COLUMNS]
                                               [direction] = 0;
                 for (column = SEARCH_COLUMNS - 1; column >= 0; --column) {
-                    int64_t minimum = INT64_MAX;
-                    int64_t maximum = INT64_MIN;
-                    unsigned candidate_limit =
-                        column == 0 ? row + 1U : DICE;
-                    unsigned candidate;
+                    unsigned candidate_mask =
+                        search->candidate_mask[row][(unsigned)column];
+                    unsigned candidate =
+                        (unsigned)__builtin_ctz(candidate_mask);
+                    int64_t minimum = (int64_t)choice_contribution(
+                        search, row, candidate, (unsigned)column, first) -
+                        (int64_t)choice_contribution(
+                            search, row, candidate, (unsigned)column,
+                            second);
+                    int64_t maximum = minimum;
 
-                    for (candidate = row; candidate < candidate_limit;
-                         ++candidate) {
+                    for (++candidate; candidate < DICE; ++candidate) {
                         int64_t value = (int64_t)choice_contribution(
                             search, row, candidate, (unsigned)column, first) -
                             (int64_t)choice_contribution(
                                 search, row, candidate, (unsigned)column,
                                 second);
+
+                        if ((candidate_mask & (1U << candidate)) == 0) {
+                            continue;
+                        }
 
                         if (value < minimum) {
                             minimum = value;
@@ -1723,13 +2240,18 @@ static void build_bounds(struct search *search, unsigned row)
         for (column = SEARCH_COLUMNS - 1; column >= 0; --column) {
             unsigned actual_column = ordered_column(
                 search, row, (unsigned)column);
-            unsigned candidate_limit = column == 0 ? row + 1U : DICE;
+            unsigned candidate_mask =
+                search->candidate_mask[row][(unsigned)column];
             uint64_t any_wins = 0;
             uint64_t all_win = lane_ones;
             unsigned candidate;
 
-            for (candidate = row; candidate < candidate_limit; ++candidate) {
+            for (candidate = row; candidate < DICE; ++candidate) {
                 uint64_t increment = 0;
+
+                if ((candidate_mask & (1U << candidate)) == 0) {
+                    continue;
+                }
 
                 for (previous = 0; previous < row; ++previous) {
                     if (search->grid[candidate][actual_column] >
@@ -2067,7 +2589,7 @@ static void record_solution(struct search *search, enum solution_kind kind)
         solution->number = number;
         for (face = 0; face < FACE_COUNT; ++face) {
             solution->encoding[face] =
-                (char)('A' + search->owner[face]);
+                (char)('A' + search->logical_die[search->owner[face]]);
         }
         solution->encoding[FACE_COUNT] = '\0';
         shared->solution_tail =
@@ -2246,6 +2768,26 @@ static void undo_choice(struct search *search, unsigned row,
 #endif
 }
 
+static bool completed_row_is_fair(struct search *search, unsigned row)
+{
+    unsigned place;
+
+    for (place = 0; place < DICE; ++place) {
+        if (search->tally[row][place] != search->place_goal) {
+            return false;
+        }
+    }
+#if !PERM_ONLY
+    if (row + 1U >= 3U) {
+        build_owner_table(search);
+    }
+    if (!completed_prefix_is_place_fair(search, row + 1U)) {
+        return false;
+    }
+#endif
+    return true;
+}
+
 /*
  * Fill one die in its planned column order.  Each branch swaps one face into
  * place, recurses, then restores that swap and its additive tallies.  There
@@ -2303,21 +2845,12 @@ static void search_row(struct search *search, unsigned row, unsigned column)
 #endif
 
     if (column == SEARCH_COLUMNS) {
-        unsigned place;
-        for (place = 0; place < DICE; ++place) {
-            if (search->tally[row][place] != search->place_goal) {
-                return;
-            }
-        }
+        if (!completed_row_is_fair(search, row)) {
 #if !PERM_ONLY
-        if (row + 1U >= 3U) {
-            build_owner_table(search);
-        }
-        if (!completed_prefix_is_place_fair(search, row + 1U)) {
             ++search->prefix_place_prunes;
+#endif
             return;
         }
-#endif
         if (row + 1U < DICE - 1U) {
             search_row(search, row + 1U, 0);
         } else {
@@ -2328,6 +2861,23 @@ static void search_row(struct search *search, unsigned row, unsigned column)
              * every remaining matchup with the last die to balance as well.
              */
             accept_configuration(search);
+        }
+        return;
+    }
+
+    if (search->template_active) {
+        unsigned mask = search->candidate_mask[row][column];
+
+        while (mask != 0) {
+            candidate = (unsigned)__builtin_ctz(mask);
+            mask &= mask - 1U;
+            apply_choice(search, row, column, candidate);
+            search_row(search, row, column + 1U);
+            undo_choice(search, row, column, candidate);
+            if (atomic_load_explicit(&search->shared->stop,
+                                     memory_order_relaxed)) {
+                return;
+            }
         }
         return;
     }
@@ -2353,7 +2903,70 @@ static void search_row(struct search *search, unsigned row, unsigned column)
     }
 }
 
-static bool initialize_search(struct search *search)
+static void prepare_template_search(struct search *search,
+                                    unsigned *start_row)
+{
+    unsigned row = 0;
+
+    if (!search->template_active) {
+        plan_column_order(search, 0);
+        build_bounds(search, 0);
+        *start_row = 0;
+        return;
+    }
+
+    while (row + 1U < DICE &&
+           search->fixed_row_count[row] == SEARCH_COLUMNS) {
+        unsigned column;
+
+        plan_column_order(search, row);
+        build_bounds(search, row);
+#if !MIRROR
+        if (row != 0) {
+            initialize_pair_wins(search, row, 0);
+        }
+#endif
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+        if (row >= 2U) {
+            build_additive_perm_bounds(search, row);
+        }
+#endif
+        for (column = 0; column < SEARCH_COLUMNS; ++column) {
+            apply_choice(search, row, column, row);
+        }
+        if (!bounds_allow_goal(search, row, SEARCH_COLUMNS) ||
+            !pair_bounds_allow_goal(search, row, SEARCH_COLUMNS)
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+            || !additive_perm_bounds_allow_goal(
+                search, row, SEARCH_COLUMNS)
+#endif
+            || !completed_row_is_fair(search, row)) {
+            search->template_possible = false;
+            *start_row = row;
+            return;
+        }
+        ++row;
+    }
+    *start_row = row;
+    if (row + 1U < DICE) {
+        plan_column_order(search, row);
+        build_bounds(search, row);
+#if !MIRROR
+        if (row != 0) {
+            initialize_pair_wins(search, row, 0);
+        }
+#endif
+#if ADDITIVE_PERM_BOUNDS_ACTIVE
+        if (row >= 2U) {
+            build_additive_perm_bounds(search, row);
+        }
+#endif
+    }
+}
+
+static bool initialize_search(struct search *search,
+                              const struct options *options,
+                              unsigned *start_row)
 {
     memset(search, 0, sizeof(*search));
 
@@ -2367,12 +2980,13 @@ static bool initialize_search(struct search *search)
     search->linear_place_bounds_possible =
         search->outcome_count <= (uint64_t)INT64_MAX;
 
-    initialize_grid(search);
+    if (!configure_template(search, options)) {
+        return false;
+    }
     if (!build_contributions(search)) {
         fprintf(stderr, "Place contributions overflowed a 64-bit tally.\n");
         return false;
     }
-    plan_column_order(search, 0);
     if (!initialize_perm_counter(&search->permutations)) {
         fprintf(stderr, "Unable to initialize the permutation counter.\n");
         return false;
@@ -2383,6 +2997,7 @@ static bool initialize_search(struct search *search)
         return false;
     }
 #endif
+    prepare_template_search(search, start_row);
     return true;
 }
 
@@ -2502,34 +3117,36 @@ static void run_prefix(struct worker *worker, uint64_t prefix)
 {
     struct search *search = &worker->search;
     uint64_t choices = prefix;
-    unsigned depth;
+    unsigned selected[SEARCH_COLUMNS];
+    unsigned column;
+    unsigned row = worker->shared->start_row;
 
-    /* Column zero is the fixed global die-renaming representative. */
-    apply_choice(search, 0, 0, 0);
-    for (depth = 0; depth < worker->shared->split_depth; ++depth) {
-        unsigned candidate = (unsigned)(choices % DICE);
-        choices /= DICE;
-        apply_choice(search, 0, depth + 1U, candidate);
+    if (row + 1U >= DICE) {
+        accept_configuration(search);
+        return;
+    }
+    for (column = 0; column < worker->shared->prefix_columns; ++column) {
+        unsigned mask = search->candidate_mask[row][column];
+        unsigned radix = (unsigned)__builtin_popcount(mask);
+        unsigned choice = (unsigned)(choices % radix);
+        unsigned candidate;
+
+        choices /= radix;
+        while (choice != 0U) {
+            mask &= mask - 1U;
+            --choice;
+        }
+        candidate = (unsigned)__builtin_ctz(mask);
+        selected[column] = candidate;
+        apply_choice(search, row, column, candidate);
     }
 
-    build_bounds(search, 0);
-    search_row(search, 0, worker->shared->split_depth + 1U);
+    search_row(search, row, worker->shared->prefix_columns);
 
-    depth = worker->shared->split_depth;
-    choices = prefix;
-    /* Decode again so choices can be undone in reverse order. */
-    {
-        unsigned selected[SEARCH_COLUMNS];
-        unsigned i;
-        for (i = 0; i < depth; ++i) {
-            selected[i] = (unsigned)(choices % DICE);
-            choices /= DICE;
-        }
-        while (depth-- > 0) {
-            undo_choice(search, 0, depth + 1U, selected[depth]);
-        }
+    column = worker->shared->prefix_columns;
+    while (column-- > 0) {
+        undo_choice(search, row, column, selected[column]);
     }
-    undo_choice(search, 0, 0, 0);
 }
 
 static bool run_job(struct worker *worker, uint64_t job)
@@ -2757,10 +3374,36 @@ static void watch_workers(struct shared_state *shared,
     }
 }
 
+static void print_template_plan(FILE *stream, const struct search *search,
+                                unsigned start_row, const char *path)
+{
+    unsigned row;
+
+    fprintf(stream, "Template plan: file=%s, row-order=", path);
+    for (row = 0; row < DICE; ++row) {
+        fprintf(stream, "%s%c(%u)", row == 0 ? "" : ",",
+                'A' + search->logical_die[row],
+                search->fixed_row_count[row]);
+    }
+    fprintf(stream, ", prebuilt-rows=%u", start_row);
+    if (start_row + 1U < DICE) {
+        unsigned column;
+
+        fprintf(stream, ", next-row=%c, column-order=",
+                'A' + search->logical_die[start_row]);
+        for (column = 0; column < SEARCH_COLUMNS; ++column) {
+            fprintf(stream, "%s%u", column == 0 ? "" : ",",
+                    search->column_order[start_row][column]);
+        }
+    }
+    fputc('\n', stream);
+}
+
 int main(int argc, char **argv)
 {
     struct shared_state shared;
     struct worker *workers = NULL;
+    struct search *prototype = NULL;
     struct options options;
     unsigned requested_threads;
     unsigned created_threads = 0;
@@ -2790,21 +3433,42 @@ int main(int argc, char **argv)
 
     memset(&shared, 0, sizeof(shared));
     shared.options = options;
+    prototype = malloc(sizeof(*prototype));
+    if (prototype == NULL) {
+        fprintf(stderr, "Unable to allocate initial search state.\n");
+        return EXIT_FAILURE;
+    }
+    if (!initialize_search(prototype, &options, &shared.start_row)) {
+        free(prototype);
+        return EXIT_FAILURE;
+    }
     shared.prefix_count = 1;
     {
         uint64_t desired_jobs = options.jobs != 0
             ? options.jobs
             : (uint64_t)requested_threads * JOBS_PER_WORKER;
 
-        while (shared.split_depth < SEARCH_COLUMNS - 1U &&
-               shared.prefix_count < desired_jobs) {
-            if (shared.prefix_count > UINT64_MAX / DICE) {
+        while (prototype->template_possible &&
+               shared.start_row + 1U < DICE &&
+               shared.prefix_columns < SEARCH_COLUMNS) {
+            unsigned mask = prototype->candidate_mask[shared.start_row]
+                [shared.prefix_columns];
+            unsigned radix = (unsigned)__builtin_popcount(mask);
+
+            if (radix > 1U && shared.prefix_count >= desired_jobs) {
+                break;
+            }
+            if (radix == 0 || shared.prefix_count > UINT64_MAX / radix) {
                 fprintf(stderr,
                         "Requested job count requires too many search prefixes.\n");
+                free(prototype);
                 return EXIT_FAILURE;
             }
-            shared.prefix_count *= DICE;
-            ++shared.split_depth;
+            shared.prefix_count *= radix;
+            ++shared.prefix_columns;
+            if (radix > 1U) {
+                ++shared.split_depth;
+            }
         }
         shared.job_count = options.jobs != 0 &&
                            options.jobs < shared.prefix_count
@@ -2847,10 +3511,9 @@ int main(int argc, char **argv)
         exit_status = EXIT_FAILURE;
         goto cleanup;
     }
-    if (!initialize_search(&workers[0].search)) {
-        exit_status = EXIT_FAILURE;
-        goto cleanup;
-    }
+    workers[0].search = *prototype;
+    free(prototype);
+    prototype = NULL;
     for (i = 0; i < shared.thread_count; ++i) {
         if (i != 0) {
             workers[i].search = workers[0].search;
@@ -2875,6 +3538,10 @@ int main(int argc, char **argv)
         atomic_init(&workers[i].stats.permutation_fair_count, 0);
     }
 
+    if (options.template_active) {
+        print_template_plan(stderr, &workers[0].search, shared.start_row,
+                            options.template_path);
+    }
     fprintf(stderr,
             "Searching %s%s%dd%d column-grouped configurations (%s) "
             "with %u pthread workers (%" PRIu64 " jobs over %" PRIu64
@@ -2892,7 +3559,11 @@ int main(int argc, char **argv)
     }
     fputs(")\n", stderr);
 
-    if (workers[0].search.outcome_count % DICE != 0) {
+    if (!workers[0].search.template_possible) {
+        fprintf(stderr,
+                "No solution is possible because a fully fixed template row "
+                "fails a required fairness check.\n");
+    } else if (workers[0].search.outcome_count % DICE != 0) {
         fprintf(stderr,
                 "No place-fair configuration is possible because %d^%d "
                 "is not divisible by %d.\n",
@@ -3017,6 +3688,16 @@ int main(int argc, char **argv)
                 if (options.random_order) {
                     fprintf(stderr, ", seed=%" PRIu64, options.seed);
                 }
+                if (options.template_active) {
+                    unsigned row;
+
+                    fprintf(stderr, ", template=%s, row-order=",
+                            options.template_path);
+                    for (row = 0; row < DICE; ++row) {
+                        fprintf(stderr, "%s%c", row == 0 ? "" : ",",
+                                'A' + workers[0].search.logical_die[row]);
+                    }
+                }
                 fputc('\n', stderr);
             }
 
@@ -3069,6 +3750,7 @@ int main(int argc, char **argv)
 
 cleanup:
     drain_solutions(&shared);
+    free(prototype);
     free(workers);
     free(shared.job_order);
     pthread_cond_destroy(&shared.solution_not_full);
