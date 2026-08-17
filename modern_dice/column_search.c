@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
@@ -27,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -182,6 +184,7 @@ struct options {
     uint64_t progress_seconds;
     unsigned threads;
     const char *template_path;
+    const char *solutions_path;
     uint8_t template_value[DICE][SIDES];
     unsigned template_lock_count;
     bool random_order;
@@ -369,6 +372,7 @@ struct shared_state {
     unsigned solution_head;
     unsigned solution_tail;
     unsigned solution_count;
+    bool solution_file_failed;
 };
 
 struct worker {
@@ -436,6 +440,8 @@ static void usage(FILE *stream, const char *program)
             "                      it must list 0 through %d exactly, in order;\n"
             "                      rows use 'A:' plus exactly SIDES entries;\n"
             "                      values are offsets, with '.' or 'x' free\n"
+            "      --solutions-file FILE\n"
+            "                      append every result with file locking\n"
             "      --random-order shuffle jobs before starting workers\n"
             "      --seed N        random-order seed; requires --random-order\n"
 #if PERM_ONLY
@@ -784,6 +790,16 @@ static bool parse_options(int argc, char **argv, struct options *options)
                 return false;
             }
             options->template_path = argv[i];
+            continue;
+        }
+        if (strcmp(argv[i], "--solutions-file") == 0) {
+            if (++i >= argc || options->solutions_path != NULL ||
+                *argv[i] == '\0') {
+                fprintf(stderr,
+                        "--solutions-file requires one non-empty file path.\n");
+                return false;
+            }
+            options->solutions_path = argv[i];
             continue;
         }
         if (strcmp(argv[i], "--seed") == 0) {
@@ -2564,6 +2580,13 @@ static void publish_worker_stats(struct search *search)
                           memory_order_relaxed);
 }
 
+static const char *solution_kind_name(enum solution_kind kind)
+{
+    return kind == ALL_SUBSET_PLACE_FAIR
+        ? "all-subset-place-fair"
+        : "permutation-fair";
+}
+
 static void record_solution(struct search *search, enum solution_kind kind)
 {
     struct shared_state *shared = search->shared;
@@ -2577,7 +2600,8 @@ static void record_solution(struct search *search, enum solution_kind kind)
     pthread_mutex_lock(&shared->solution_mutex);
     number = atomic_fetch_add_explicit(total, 1,
                                        memory_order_relaxed) + 1U;
-    if (number <= shared->options.print_limit) {
+    if (number <= shared->options.print_limit ||
+        shared->options.solutions_path != NULL) {
         struct solution *solution;
 
         while (shared->solution_count == SOLUTION_QUEUE_CAPACITY) {
@@ -3204,6 +3228,60 @@ static void *worker_main(void *argument)
     return NULL;
 }
 
+static bool append_solution_file(const struct shared_state *shared,
+                                 const struct solution *solution)
+{
+    char record[FACE_COUNT + 128U];
+    size_t written = 0;
+    int descriptor = -1;
+    int length;
+    int saved_errno;
+
+    length = snprintf(record, sizeof(record),
+                      "%s config=%dd%d mirror=%d encoding=%s\n",
+                      solution_kind_name(solution->kind), DICE, SIDES,
+                      MIRROR, solution->encoding);
+    if (length < 0 || (size_t)length >= sizeof(record)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+
+    descriptor = open(shared->options.solutions_path,
+                      O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (descriptor < 0) {
+        return false;
+    }
+    while (flock(descriptor, LOCK_EX) != 0) {
+        if (errno != EINTR) {
+            goto fail;
+        }
+    }
+    while (written < (size_t)length) {
+        ssize_t result = write(descriptor, record + written,
+                               (size_t)length - written);
+
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result == 0) {
+            errno = EIO;
+            goto fail;
+        } else if (errno != EINTR) {
+            goto fail;
+        }
+    }
+    /* Closing releases the lock; no descriptor is retained between results. */
+    if (close(descriptor) != 0) {
+        return false;
+    }
+    return true;
+
+fail:
+    saved_errno = errno;
+    close(descriptor);
+    errno = saved_errno;
+    return false;
+}
+
 static void drain_solutions(struct shared_state *shared)
 {
     for (;;) {
@@ -3223,11 +3301,25 @@ static void drain_solutions(struct shared_state *shared)
         if (!have_solution) {
             break;
         }
-        printf("%s #%" PRIu64 " encoding=%s\n",
-               solution.kind == ALL_SUBSET_PLACE_FAIR
-                   ? "all-subset-place-fair"
-                   : "permutation-fair",
-               solution.number, solution.encoding);
+        if (shared->options.solutions_path != NULL &&
+            !shared->solution_file_failed &&
+            !append_solution_file(shared, &solution)) {
+            int append_errno = errno;
+
+            fprintf(stderr, "Unable to append solution to '%s': %s\n",
+                    shared->options.solutions_path,
+                    strerror(append_errno));
+            shared->solution_file_failed = true;
+            atomic_store_explicit(&shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&shared->stop, true,
+                                  memory_order_relaxed);
+        }
+        if (solution.number <= shared->options.print_limit) {
+            printf("%s #%" PRIu64 " encoding=%s\n",
+                   solution_kind_name(solution.kind),
+                   solution.number, solution.encoding);
+        }
     }
     fflush(stdout);
 }
@@ -3352,14 +3444,19 @@ static void watch_workers(struct shared_state *shared,
                                   memory_order_relaxed) >
                  shared->options.print_limit)) {
             fprintf(stderr,
-                    "Solution output limited to the first %" PRIu64
+                    "Terminal solution output limited to the first %" PRIu64
 #if PERM_ONLY
-                    " results; use --all-solutions for the complete stream.\n",
+                    " results; use --all-solutions for the complete stream",
 #else
                     " results in each class; use --all-solutions for the "
-                    "complete streams.\n",
+                    "complete streams",
 #endif
                     shared->options.print_limit);
+            if (shared->options.solutions_path != NULL) {
+                fputs("; the solutions file still receives every result",
+                      stderr);
+            }
+            fputs(".\n", stderr);
             suppression_reported = true;
         }
         if (running == 0) {
@@ -3557,6 +3654,9 @@ int main(int argc, char **argv)
     if (options.random_order) {
         fprintf(stderr, ", seed=%" PRIu64, options.seed);
     }
+    if (options.solutions_path != NULL) {
+        fprintf(stderr, ", solutions-file=%s", options.solutions_path);
+    }
     fputs(")\n", stderr);
 
     if (!workers[0].search.template_possible) {
@@ -3629,9 +3729,16 @@ int main(int argc, char **argv)
                     : (uint64_t)(nodes_per_second + 0.5);
             uint64_t permutation_total = atomic_load_explicit(
                 &shared.permutation_total, memory_order_relaxed);
+            uint64_t jobs_done = atomic_load_explicit(
+                &shared.jobs_done, memory_order_relaxed);
+            bool search_error = atomic_load_explicit(
+                &shared.internal_error, memory_order_relaxed);
             bool hit_limit = options.limit != 0 &&
                 atomic_load_explicit(&shared.limit_claims,
                                      memory_order_relaxed) >= options.limit;
+            bool incomplete_search = jobs_done != shared.job_count &&
+                !hit_limit && !sigint_requested;
+            bool search_failed;
             char nodes[SI_COUNT_TEXT_SIZE];
             char node_rate[SI_COUNT_TEXT_SIZE];
             char bound_prunes[SI_COUNT_TEXT_SIZE];
@@ -3673,6 +3780,19 @@ int main(int argc, char **argv)
             format_si_count(all_subset_place_fair, all_subset_total);
 #endif
 
+            if (search_error) {
+                exit_status = EXIT_FAILURE;
+            }
+            if (incomplete_search) {
+                if (exit_status == EXIT_SUCCESS) {
+                    fprintf(stderr,
+                            "Search stopped before every scheduled job "
+                            "completed.\n");
+                }
+                exit_status = EXIT_FAILURE;
+            }
+            search_failed = exit_status != EXIT_SUCCESS;
+
             if (sigint_requested) {
                 fprintf(stderr,
                         "Interrupted search configuration: %s%s%dd%d "
@@ -3687,6 +3807,10 @@ int main(int argc, char **argv)
                         options.random_order ? "random" : "sequential");
                 if (options.random_order) {
                     fprintf(stderr, ", seed=%" PRIu64, options.seed);
+                }
+                if (options.solutions_path != NULL) {
+                    fprintf(stderr, ", solutions-file=%s",
+                            options.solutions_path);
                 }
                 if (options.template_active) {
                     unsigned row;
@@ -3718,11 +3842,11 @@ int main(int argc, char **argv)
 #endif
                     ", permutation-fair=%s\n",
                     sigint_requested ? "interrupted" :
-                        (hit_limit ? "stopped at limit" : "complete"),
+                        (search_failed ? "failed" :
+                            (hit_limit ? "stopped at limit" : "complete")),
                     elapsed,
                     shared.thread_count,
-                    atomic_load_explicit(&shared.jobs_done,
-                                         memory_order_relaxed),
+                    jobs_done,
                     shared.job_count, nodes, node_rate,
                     bound_prunes, linear_place_prunes,
                     pair_bound_prunes,
@@ -3741,7 +3865,9 @@ int main(int argc, char **argv)
     }
 
     if (atomic_load_explicit(&shared.internal_error, memory_order_relaxed)) {
-        fprintf(stderr, "A worker reported an internal search error.\n");
+        if (!shared.solution_file_failed) {
+            fprintf(stderr, "A worker reported an internal search error.\n");
+        }
         exit_status = EXIT_FAILURE;
     }
     if (sigint_requested && exit_status == EXIT_SUCCESS) {
