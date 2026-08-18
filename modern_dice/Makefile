@@ -23,6 +23,9 @@ CFLAGS ?= -O3 -march=native -flto
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDLIBS += -pthread
 
+RESIDUAL_CPPFLAGS = -DRESIDUAL_RIGHT_END_CHECK=$(RESIDUAL_RIGHT_END) \
+	-DRESIDUAL_TWO_END_SEARCH=$(RESIDUAL_TWO_END)
+
 all: column_search weave_search residual_search
 
 pgo: pgo-column_search
@@ -36,8 +39,7 @@ weave_search: weave_search.c FORCE
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 residual_search: residual_search.c FORCE
-	$(CC) $(CPPFLAGS) -DRESIDUAL_RIGHT_END_CHECK=$(RESIDUAL_RIGHT_END) \
-		-DRESIDUAL_TWO_END_SEARCH=$(RESIDUAL_TWO_END) \
+	$(CC) $(CPPFLAGS) $(RESIDUAL_CPPFLAGS) \
 		$(CFLAGS) -o $@ $< $(LDLIBS)
 
 # Build and train using the same output pathname that the profile-consuming
@@ -52,10 +54,11 @@ define build_with_pgo
 	cleanup() { rm -rf "$${pgo_dir:?}"; }; \
 	trap cleanup EXIT; \
 	trap 'exit 130' HUP INT TERM; \
-	echo "Building instrumented $(1) (PERM_ONLY=$(PERM_ONLY))"; \
-	$(PGO_CC) $(CPPFLAGS) $(CFLAGS) \
+	echo "Building instrumented $(1)" \
+		"(DICE=$(DICE), SIDES=$(SIDES), PERM_ONLY=$(PERM_ONLY))"; \
+	$(PGO_CC) $(CPPFLAGS) $(3) $(CFLAGS) \
 		-fprofile-generate="$$pgo_dir" -fprofile-update=atomic \
-		-o $(1) column_search.c $(LDLIBS); \
+		-o $(1) $(2) $(LDLIBS); \
 	echo "Training $(1) for up to $(PGO_SECONDS) seconds"; \
 	status=0; \
 	timeout --signal=INT --kill-after=2s $(PGO_SECONDS)s \
@@ -65,20 +68,24 @@ define build_with_pgo
 		*) echo "PGO training failed with status $$status" >&2; exit $$status ;; \
 	esac; \
 	echo "Rebuilding $(1) with the collected profile"; \
-	$(PGO_CC) $(CPPFLAGS) $(CFLAGS) \
+	$(PGO_CC) $(CPPFLAGS) $(3) $(CFLAGS) \
 		-fprofile-use="$$pgo_dir" -fprofile-correction \
 		-fprofile-partial-training -Wno-missing-profile \
-		-o $(1) column_search.c $(LDLIBS)
+		-o $(1) $(2) $(LDLIBS)
 endef
 
 pgo-column_search: column_search.c FORCE
-	$(call build_with_pgo,column_search)
+	$(call build_with_pgo,column_search,column_search.c)
 
 pgo-permutation_search: override PERM_ONLY = 1
 pgo-permutation_search: column_search.c FORCE
-	$(call build_with_pgo,permutation_search)
+	$(call build_with_pgo,permutation_search,column_search.c)
 
-.PHONY: all pgo pgo-column_search pgo-permutation_search FORCE clean
+pgo-residual_search: residual_search.c FORCE
+	$(call build_with_pgo,residual_search,residual_search.c,$(RESIDUAL_CPPFLAGS))
+
+.PHONY: all pgo pgo-column_search pgo-permutation_search \
+	pgo-residual_search FORCE clean
 FORCE:
 
 clean:

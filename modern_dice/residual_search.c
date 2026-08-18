@@ -44,6 +44,10 @@
 #define SIDES 12
 #endif
 
+#ifndef MIRROR
+#define MIRROR 0
+#endif
+
 #ifndef RESIDUAL_RIGHT_END_CHECK
 #define RESIDUAL_RIGHT_END_CHECK 1
 #endif
@@ -52,12 +56,26 @@
 #define RESIDUAL_TWO_END_SEARCH 1
 #endif
 
+#if MIRROR != 0 && MIRROR != 1
+#error "MIRROR must be either 0 or 1"
+#endif
+
+#if MIRROR && ((SIDES % 2) != 0)
+#error "Mirror-symmetric dice require an even SIDES value"
+#endif
+
 #define FACE_COUNT (DICE * SIDES)
 #define DEFAULT_PRINT_LIMIT UINT64_C(10)
 #define DEFAULT_JOBS_PER_THREAD UINT64_C(8)
 #define PUBLISH_NODE_INTERVAL UINT64_C(1048576)
 #define STOP_POLL_INTERVAL UINT64_C(4096)
 #define PREFIX_RIGHT_FLAG UINT8_C(0x80)
+#if MIRROR
+#define SEARCH_STEP_FACES 2U
+#else
+#define SEARCH_STEP_FACES 1U
+#endif
+#define SEARCH_DECISION_COUNT (FACE_COUNT / SEARCH_STEP_FACES)
 
 #if DICE == 2
 #define PERM_STATE_COUNT 5U
@@ -212,7 +230,8 @@ static void usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage: %s [OPTIONS]\n\n"
-            "Exhaustively search canonical %dd%d owner strings using exact "
+            "Exhaustively search canonical %s%dd%d owner strings using "
+            "exact "
             "residual roll counts.\n\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
             "  -j, --jobs N        logical prefix jobs; default is 8 per worker\n"
@@ -224,7 +243,7 @@ static void usage(FILE *stream, const char *program)
             "      --seed N        random-order seed; requires --random-order\n"
             "  -q, --quiet         suppress configuration output\n"
             "  -h, --help          show this help\n",
-            program, DICE, SIDES);
+            program, MIRROR ? "mirrored " : "", DICE, SIDES);
 }
 
 static bool parse_uint64(const char *text, uint64_t *value)
@@ -559,7 +578,7 @@ static void restore_prefix_owner(struct search *search, unsigned owner)
     }
 }
 
-#if RESIDUAL_TWO_END_SEARCH
+#if RESIDUAL_TWO_END_SEARCH || MIRROR
 static void subtract_suffix_owner(struct search *search, unsigned owner)
 {
     unsigned edge;
@@ -585,6 +604,7 @@ static void restore_suffix_owner(struct search *search, unsigned owner)
 }
 #endif
 
+#if !MIRROR
 static unsigned feasible_owner_mask(
     const struct search *search,
     const struct edge (*edges)[OWNER_EDGE_COUNT], unsigned owner_limit)
@@ -639,7 +659,9 @@ static bool has_feasible_owner(
     }
     return false;
 }
+#endif
 
+#if !MIRROR
 static unsigned available_owner_mask(const struct search *search,
                                      unsigned owner_limit)
 {
@@ -653,6 +675,7 @@ static unsigned available_owner_mask(const struct search *search,
     }
     return mask;
 }
+#endif
 
 static unsigned owner_mask_count(unsigned mask)
 {
@@ -676,6 +699,7 @@ static unsigned owner_mask_count(unsigned mask)
  * is nonnegative.  We do not modify the residual here: finding any possible
  * final owner is enough to keep searching from the left.
  */
+#if !MIRROR
 #if RESIDUAL_RIGHT_END_CHECK
 static bool has_feasible_last_owner(const struct search *search)
 {
@@ -736,6 +760,83 @@ static struct end_plan plan_search_end(const struct search *search,
     };
 }
 #endif
+#endif
+
+#if MIRROR
+/* A mirrored decision removes the same owner from both residual ends. */
+static struct end_plan plan_mirror_pairs(struct search *search,
+                                         unsigned used_labels)
+{
+    unsigned owner_limit = used_labels < DICE ? used_labels + 1U : DICE;
+    unsigned available = 0;
+    unsigned feasible = 0;
+    unsigned owner;
+
+    /*
+     * Prepend and append updates for one owner have disjoint destinations
+     * except for the singleton counter.  remaining >= 2 proves that shared
+     * counter can absorb both updates, so no speculative update/restore is
+     * needed while constructing the candidate mask.
+     */
+    for (owner = 0; owner < owner_limit; ++owner) {
+        unsigned edge;
+
+        if (search->remaining[owner] < 2U) {
+            continue;
+        }
+        available |= 1U << owner;
+        for (edge = 0; edge < OWNER_EDGE_COUNT; ++edge) {
+            const struct edge *transition = &search->prepend[owner][edge];
+
+            if (search->residual[transition->destination] <
+                search->residual[transition->source]) {
+                break;
+            }
+        }
+        if (edge != OWNER_EDGE_COUNT) {
+            continue;
+        }
+        for (edge = 0; edge < OWNER_EDGE_COUNT; ++edge) {
+            const struct edge *transition = &search->append[owner][edge];
+
+            if (search->residual[transition->destination] <
+                search->residual[transition->source]) {
+                break;
+            }
+        }
+        if (edge == OWNER_EDGE_COUNT) {
+            feasible |= 1U << owner;
+        }
+    }
+    return (struct end_plan){
+        .end = SEARCH_LEFT,
+        .owner_mask = feasible,
+        .rejected_owners = owner_mask_count(available) -
+            owner_mask_count(feasible),
+    };
+}
+
+static enum owner_result try_mirror_pair(struct search *search,
+                                         unsigned owner,
+                                         unsigned left_depth,
+                                         unsigned right_depth)
+{
+    search->remaining[owner] -= 2U;
+    search->encoding[left_depth] = (char)('a' + owner);
+    search->encoding[FACE_COUNT - 1U - right_depth] =
+        (char)('a' + owner);
+    subtract_prefix_owner(search, owner);
+    subtract_suffix_owner(search, owner);
+    return OWNER_ACCEPTED;
+}
+
+static void undo_mirror_pair(struct search *search, unsigned owner)
+{
+    restore_suffix_owner(search, owner);
+    restore_prefix_owner(search, owner);
+    search->remaining[owner] += 2U;
+}
+#endif
 
 static bool verify_configuration(const struct search *search)
 {
@@ -766,6 +867,7 @@ static bool verify_configuration(const struct search *search)
     return true;
 }
 
+#if !MIRROR
 static enum owner_result try_owner(struct search *search, unsigned owner,
                                    unsigned assigned, unsigned position,
                                    enum search_end end)
@@ -812,6 +914,7 @@ static void undo_owner(struct search *search, unsigned owner,
     restore_prefix_owner(search, owner);
     ++search->remaining[owner];
 }
+#endif
 
 static void publish_stats(const struct search *search)
 {
@@ -910,7 +1013,9 @@ static void search_configurations(struct search *search, unsigned left_depth,
     unsigned assigned = left_depth + right_depth;
     struct end_plan plan;
     enum search_end end;
+#if !MIRROR
     unsigned position;
+#endif
     unsigned owner;
 
     if (search->internal_error) {
@@ -938,19 +1043,32 @@ static void search_configurations(struct search *search, unsigned left_depth,
         return;
     }
 
+#if MIRROR
+    plan = plan_mirror_pairs(search, used_labels);
+#else
     plan = plan_search_end(search, used_labels);
+#endif
     end = plan.end;
     search->negative_prunes += plan.rejected_owners;
+#if !MIRROR
     position = end == SEARCH_LEFT ? left_depth :
         FACE_COUNT - 1U - right_depth;
+#endif
 
     for (owner = 0; owner < DICE; ++owner) {
-        bool new_label = end == SEARCH_LEFT && owner == used_labels;
+        bool new_label = owner == used_labels &&
+            (MIRROR || end == SEARCH_LEFT);
+        enum owner_result result;
 
         if ((plan.owner_mask & (1U << owner)) == 0) {
             continue;
         }
-        switch (try_owner(search, owner, assigned, position, end)) {
+#if MIRROR
+        result = try_mirror_pair(search, owner, left_depth, right_depth);
+#else
+        result = try_owner(search, owner, assigned, position, end);
+#endif
+        switch (result) {
         case OWNER_RIGHT_END_IMPOSSIBLE:
             ++search->right_end_prunes;
             break;
@@ -959,10 +1077,15 @@ static void search_configurations(struct search *search, unsigned left_depth,
             break;
         case OWNER_ACCEPTED:
             search_configurations(
-                search, left_depth + (end == SEARCH_LEFT ? 1U : 0U),
-                right_depth + (end == SEARCH_RIGHT ? 1U : 0U),
+                search,
+                left_depth + (MIRROR || end == SEARCH_LEFT ? 1U : 0U),
+                right_depth + (MIRROR || end == SEARCH_RIGHT ? 1U : 0U),
                 used_labels + (new_label ? 1U : 0U));
+#if MIRROR
+            undo_mirror_pair(search, owner);
+#else
             undo_owner(search, owner, end);
+#endif
             break;
         }
         if (search->internal_error) {
@@ -1002,32 +1125,48 @@ static bool collect_prefixes(struct search *search,
                              unsigned used_labels)
 {
     unsigned assigned = left_depth + right_depth;
+    unsigned decision_depth = assigned / SEARCH_STEP_FACES;
     struct end_plan plan;
     enum search_end end;
+#if !MIRROR
     unsigned position;
+#endif
     unsigned owner;
 
     if (interrupt_requested) {
         return false;
     }
-    if (assigned == prefixes->depth) {
+    if (decision_depth == prefixes->depth) {
         return append_prefix(prefixes, steps);
     }
     ++search->nodes;
+#if MIRROR
+    plan = plan_mirror_pairs(search, used_labels);
+#else
     plan = plan_search_end(search, used_labels);
+#endif
     end = plan.end;
     search->negative_prunes += plan.rejected_owners;
+#if !MIRROR
     position = end == SEARCH_LEFT ? left_depth :
         FACE_COUNT - 1U - right_depth;
+#endif
     for (owner = 0; owner < DICE; ++owner) {
-        bool new_label = end == SEARCH_LEFT && owner == used_labels;
+        bool new_label = owner == used_labels &&
+            (MIRROR || end == SEARCH_LEFT);
+        enum owner_result result;
 
         if ((plan.owner_mask & (1U << owner)) == 0) {
             continue;
         }
-        steps[assigned] = (uint8_t)owner |
+        steps[decision_depth] = (uint8_t)owner |
             (end == SEARCH_RIGHT ? PREFIX_RIGHT_FLAG : 0U);
-        switch (try_owner(search, owner, assigned, position, end)) {
+#if MIRROR
+        result = try_mirror_pair(search, owner, left_depth, right_depth);
+#else
+        result = try_owner(search, owner, assigned, position, end);
+#endif
+        switch (result) {
         case OWNER_RIGHT_END_IMPOSSIBLE:
             ++search->right_end_prunes;
             break;
@@ -1037,13 +1176,23 @@ static bool collect_prefixes(struct search *search,
         case OWNER_ACCEPTED:
             if (!collect_prefixes(
                     search, prefixes, steps,
-                    left_depth + (end == SEARCH_LEFT ? 1U : 0U),
-                    right_depth + (end == SEARCH_RIGHT ? 1U : 0U),
+                    left_depth +
+                        (MIRROR || end == SEARCH_LEFT ? 1U : 0U),
+                    right_depth +
+                        (MIRROR || end == SEARCH_RIGHT ? 1U : 0U),
                     used_labels + (new_label ? 1U : 0U))) {
+#if MIRROR
+                undo_mirror_pair(search, owner);
+#else
                 undo_owner(search, owner, end);
+#endif
                 return false;
             }
+#if MIRROR
+            undo_mirror_pair(search, owner);
+#else
             undo_owner(search, owner, end);
+#endif
             break;
         }
     }
@@ -1057,7 +1206,7 @@ static bool build_prefixes(struct search *prototype,
     uint8_t steps[FACE_COUNT];
     unsigned depth;
 
-    for (depth = 1; depth <= FACE_COUNT; ++depth) {
+    for (depth = 1; depth <= SEARCH_DECISION_COUNT; ++depth) {
         free(prefixes->owners);
         *prefixes = (struct prefix_list){.depth = depth};
         prototype->nodes = 0;
@@ -1068,7 +1217,7 @@ static bool build_prefixes(struct search *prototype,
             return false;
         }
         if (prefixes->count == 0 || prefixes->count >= desired_jobs ||
-            depth == FACE_COUNT) {
+            depth == SEARCH_DECISION_COUNT) {
             return true;
         }
     }
@@ -1112,16 +1261,37 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
 
     for (depth = 0; depth < prefixes->depth; ++depth) {
         uint8_t step = prefix[depth];
+#if MIRROR
+        struct end_plan plan = plan_mirror_pairs(search, used_labels);
+#else
         struct end_plan plan = plan_search_end(search, used_labels);
+#endif
         enum search_end end = (step & PREFIX_RIGHT_FLAG) != 0
             ? SEARCH_RIGHT : SEARCH_LEFT;
         unsigned owner = step & ~PREFIX_RIGHT_FLAG;
+#if !MIRROR
+        unsigned assigned = left_depth + right_depth;
         unsigned position = end == SEARCH_LEFT ? left_depth :
             FACE_COUNT - 1U - right_depth;
+#endif
+        enum owner_result result;
 
-        if (owner >= DICE || search->remaining[owner] == 0 ||
-            end != plan.end || (plan.owner_mask & (1U << owner)) == 0 ||
-            try_owner(search, owner, depth, position, end) != OWNER_ACCEPTED) {
+        if (owner >= DICE ||
+            search->remaining[owner] < SEARCH_STEP_FACES ||
+            end != plan.end || (plan.owner_mask & (1U << owner)) == 0) {
+            search->internal_error = true;
+            atomic_store_explicit(&search->shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&search->shared->stop, true,
+                                  memory_order_relaxed);
+            break;
+        }
+#if MIRROR
+        result = try_mirror_pair(search, owner, left_depth, right_depth);
+#else
+        result = try_owner(search, owner, assigned, position, end);
+#endif
+        if (result != OWNER_ACCEPTED) {
             search->internal_error = true;
             atomic_store_explicit(&search->shared->internal_error, true,
                                   memory_order_relaxed);
@@ -1130,9 +1300,9 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
             break;
         }
         ++applied;
-        left_depth += end == SEARCH_LEFT;
-        right_depth += end == SEARCH_RIGHT;
-        if (end == SEARCH_LEFT && owner == used_labels) {
+        left_depth += MIRROR || end == SEARCH_LEFT;
+        right_depth += MIRROR || end == SEARCH_RIGHT;
+        if ((MIRROR || end == SEARCH_LEFT) && owner == used_labels) {
             ++used_labels;
         }
     }
@@ -1141,13 +1311,19 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
     }
     while (applied > 0) {
         uint8_t step;
+#if !MIRROR
         enum search_end end;
+#endif
 
         --applied;
         step = prefix[applied];
+#if MIRROR
+        undo_mirror_pair(search, step & ~PREFIX_RIGHT_FLAG);
+#else
         end = (step & PREFIX_RIGHT_FLAG) != 0
             ? SEARCH_RIGHT : SEARCH_LEFT;
         undo_owner(search, step & ~PREFIX_RIGHT_FLAG, end);
+#endif
     }
     return !search_should_stop(search);
 }
@@ -1201,6 +1377,64 @@ static void *worker_main(void *argument)
     return NULL;
 }
 
+#define SI_COUNT_TEXT_SIZE 24
+
+/* Keep exact small counts, then use four significant digits and an SI suffix. */
+static void format_si_count(char text[SI_COUNT_TEXT_SIZE], uint64_t value)
+{
+    static const char suffixes[] = "kMGTPE";
+    uint64_t divisor = UINT64_C(1000);
+    uint64_t factor;
+    uint64_t rounded;
+    unsigned suffix = 0;
+
+    if (value <= UINT64_C(9999)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64, value);
+        return;
+    }
+
+    while (suffix + 1U < sizeof(suffixes) - 1U &&
+           value / divisor >= UINT64_C(1000)) {
+        divisor *= UINT64_C(1000);
+        ++suffix;
+    }
+
+    for (;;) {
+        uint64_t whole = value / divisor;
+        uint64_t remainder = value % divisor;
+        uint64_t unit;
+
+        factor = whole >= 100U ? UINT64_C(10) :
+            (whole >= 10U ? UINT64_C(100) : UINT64_C(1000));
+        for (;;) {
+            unit = divisor / factor;
+            rounded = whole * factor +
+                (remainder + unit / 2U) / unit;
+            if (rounded < UINT64_C(10000) || factor == UINT64_C(10)) {
+                break;
+            }
+            factor /= UINT64_C(10);
+        }
+        if (rounded < UINT64_C(10000) ||
+            suffix + 1U >= sizeof(suffixes) - 1U) {
+            break;
+        }
+        divisor *= UINT64_C(1000);
+        ++suffix;
+    }
+
+    if (factor == UINT64_C(1000)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%03" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    } else if (factor == UINT64_C(100)) {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%02" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    } else {
+        snprintf(text, SI_COUNT_TEXT_SIZE, "%" PRIu64 ".%01" PRIu64 "%c",
+                 rounded / factor, rounded % factor, suffixes[suffix]);
+    }
+}
+
 static struct totals collect_totals(const struct shared_state *shared,
                                     const struct worker *workers,
                                     unsigned worker_count)
@@ -1240,8 +1474,10 @@ static void drain_solutions(struct shared_state *shared)
     while (solution != NULL) {
         struct solution *next = solution->next;
 
-        printf("permutation-fair #%" PRIu64 " depth=%dd%d encoding=%s\n",
-               solution->number, DICE, SIDES, solution->encoding);
+        printf("permutation-fair #%" PRIu64
+               " depth=%dd%d mirror=%d encoding=%s\n",
+               solution->number, DICE, SIDES, MIRROR,
+               solution->encoding);
         free(solution);
         solution = next;
     }
@@ -1258,16 +1494,26 @@ static void print_progress(const struct shared_state *shared,
                                               memory_order_relaxed);
     unsigned active = atomic_load_explicit(&shared->active_workers,
                                            memory_order_relaxed);
+    char nodes[SI_COUNT_TEXT_SIZE];
+    char negative_prunes[SI_COUNT_TEXT_SIZE];
+    char right_end_prunes[SI_COUNT_TEXT_SIZE];
+    char left_end_prunes[SI_COUNT_TEXT_SIZE];
+    char configurations[SI_COUNT_TEXT_SIZE];
+
+    format_si_count(nodes, totals.nodes);
+    format_si_count(negative_prunes, totals.negative_prunes);
+    format_si_count(right_end_prunes, totals.right_end_prunes);
+    format_si_count(left_end_prunes, totals.left_end_prunes);
+    format_si_count(configurations, totals.configurations);
 
     fprintf(stderr,
             "%sprogress: %.1fs, workers=%u, jobs=%" PRIu64 "/%" PRIu64
-            ", nodes=%" PRIu64 ", negative-prunes=%" PRIu64
-            ", right-end-prunes=%" PRIu64 ", left-end-prunes=%" PRIu64
-            ", permutation-fair=%" PRIu64 "%s",
+            ", nodes=%s, negative-prunes=%s"
+            ", right-end-prunes=%s, left-end-prunes=%s"
+            ", permutation-fair=%s%s",
             terminal ? "\r" : "", monotonic_seconds() - start_time, active,
-            jobs_done, shared->job_count, totals.nodes,
-            totals.negative_prunes, totals.right_end_prunes,
-            totals.left_end_prunes, totals.configurations,
+            jobs_done, shared->job_count, nodes, negative_prunes,
+            right_end_prunes, left_end_prunes, configurations,
             terminal ? "\033[K" : "\n");
     fflush(stderr);
 }
@@ -1391,8 +1637,9 @@ int main(int argc, char **argv)
         if (interrupt_requested) {
             fprintf(stderr,
                     "Search interrupted during prefix-job setup: %.3fs, "
-                    "configuration=%dd%d, order=%s",
+                    "configuration=%dd%d, mirror=%d, order=%s",
                     monotonic_seconds() - start_time, DICE, SIDES,
+                    MIRROR,
                     options.random_order ? "random" : "canonical");
             if (options.random_order) {
                 fprintf(stderr, ", seed=%" PRIu64, options.seed);
@@ -1496,16 +1743,18 @@ int main(int argc, char **argv)
     }
 
     fprintf(stderr,
-            "Searching essentially different %dd%d configurations by "
-            "residual-prefix search (%u states; right-end checks %s; "
-            "two-end fail-first %s) with "
+            "Searching essentially different %s%dd%d configurations by "
+            "residual-prefix search (%u states; %s) with "
             "%u pthread workers (%" PRIu64 " jobs over %" PRIu64
-            " prefixes, split depth %u; order=%s",
-            DICE, SIDES, PERM_STATE_COUNT,
-            RESIDUAL_RIGHT_END_CHECK ? "enabled" : "disabled",
-            RESIDUAL_TWO_END_SEARCH ? "enabled" : "disabled",
+            " prefixes, split depth %u %s; order=%s",
+            MIRROR ? "mirrored " : "", DICE, SIDES, PERM_STATE_COUNT,
+            MIRROR ? "forced mirror-pair peeling" :
+            RESIDUAL_TWO_END_SEARCH ? "two-end fail-first enabled" :
+            RESIDUAL_RIGHT_END_CHECK ? "right-end checks enabled" :
+                                       "left-only peeling",
             worker_count, shared.job_count, shared.prefixes.count,
             shared.prefixes.depth,
+            MIRROR ? "mirrored pairs" : "faces",
             options.random_order ? "random" : "canonical");
     if (options.random_order) {
         fprintf(stderr, ", seed=%" PRIu64, options.seed);
@@ -1557,6 +1806,17 @@ int main(int argc, char **argv)
         bool solution_limit_reached = options.limit != 0 &&
             totals.configurations >= options.limit;
         const char *status;
+        char nodes[SI_COUNT_TEXT_SIZE];
+        char negative_prunes[SI_COUNT_TEXT_SIZE];
+        char right_end_prunes[SI_COUNT_TEXT_SIZE];
+        char left_end_prunes[SI_COUNT_TEXT_SIZE];
+        char configurations[SI_COUNT_TEXT_SIZE];
+
+        format_si_count(nodes, totals.nodes);
+        format_si_count(negative_prunes, totals.negative_prunes);
+        format_si_count(right_end_prunes, totals.right_end_prunes);
+        format_si_count(left_end_prunes, totals.left_end_prunes);
+        format_si_count(configurations, totals.configurations);
 
         if (!interrupt_requested && !node_limit_reached &&
             !solution_limit_reached && exit_status == EXIT_SUCCESS &&
@@ -1572,22 +1832,24 @@ int main(int argc, char **argv)
 
         fprintf(stderr,
                 "%s: %.3fs, configuration=%dd%d, workers=%u, jobs=%" PRIu64
-                "/%" PRIu64 ", split-depth=%u, order=%s",
+                "/%" PRIu64 ", mirror=%d, split-depth=%u, split-unit=%s, "
+                "order=%s",
                 status, monotonic_seconds() - start_time, DICE, SIDES,
                 worker_count, jobs_done, shared.job_count,
+                MIRROR,
                 shared.prefixes.depth,
+                MIRROR ? "pairs" : "faces",
                 options.random_order ? "random" : "canonical");
         if (options.random_order) {
             fprintf(stderr, ", seed=%" PRIu64, options.seed);
         }
         fprintf(stderr,
-                ", nodes=%" PRIu64 ", negative-prunes=%" PRIu64
-                ", right-end-prunes=%" PRIu64
-                ", left-end-prunes=%" PRIu64
-                ", permutation-fair=%" PRIu64 "\n",
-                totals.nodes, totals.negative_prunes,
-                totals.right_end_prunes, totals.left_end_prunes,
-                totals.configurations);
+                ", nodes=%s, negative-prunes=%s"
+                ", right-end-prunes=%s"
+                ", left-end-prunes=%s"
+                ", permutation-fair=%s\n",
+                nodes, negative_prunes, right_end_prunes, left_end_prunes,
+                configurations);
     }
     if (interrupt_requested && exit_status == EXIT_SUCCESS) {
         exit_status = 128 + SIGINT;
