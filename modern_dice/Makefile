@@ -9,6 +9,8 @@ PERM_ONLY ?= 0
 PERM_LINEAR ?= 1
 LINEAR_STRIDE ?= 2
 PERM_LINEAR_STRIDE ?= 3
+RESIDUAL_RIGHT_END ?= 1
+RESIDUAL_TWO_END ?= 1
 PGO_SECONDS ?= 5
 PGO_RUN_ARGS ?= --quiet --threads 1 --jobs 256 --random-order --seed 1
 
@@ -21,7 +23,7 @@ CFLAGS ?= -O3 -march=native -flto
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDLIBS += -pthread
 
-all: column_search
+all: column_search weave_search residual_search
 
 pgo: pgo-column_search
 
@@ -29,6 +31,14 @@ permutation_search: override PERM_ONLY = 1
 
 column_search permutation_search: column_search.c FORCE
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+weave_search: weave_search.c FORCE
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDLIBS)
+
+residual_search: residual_search.c FORCE
+	$(CC) $(CPPFLAGS) -DRESIDUAL_RIGHT_END_CHECK=$(RESIDUAL_RIGHT_END) \
+		-DRESIDUAL_TWO_END_SEARCH=$(RESIDUAL_TWO_END) \
+		$(CFLAGS) -o $@ $< $(LDLIBS)
 
 # Build and train using the same output pathname that the profile-consuming
 # build will use.  GCC incorporates that pathname into its profile filenames.
@@ -72,4 +82,4 @@ pgo-permutation_search: column_search.c FORCE
 FORCE:
 
 clean:
-	rm -f column_search permutation_search
+	rm -f column_search permutation_search weave_search residual_search
