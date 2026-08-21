@@ -185,6 +185,7 @@ struct prefix_list {
     unsigned depth;
 };
 
+#if RESIDUAL_EXTENSION
 struct extension_base {
     uint8_t *owners;
     uint16_t sides;
@@ -212,6 +213,7 @@ struct extension_cursor {
     unsigned right_depth;
     unsigned used_labels;
 };
+#endif
 
 struct published_stats {
     atomic_uint_fast64_t nodes;
@@ -226,16 +228,20 @@ struct solution {
     char encoding[FACE_COUNT + 1U];
 };
 
+#if RESIDUAL_EXTENSION
 struct solution_set {
     char **slots;
     size_t count;
     size_t capacity;
 };
+#endif
 
 struct shared_state {
     struct options options;
     struct prefix_list prefixes;
+#if RESIDUAL_EXTENSION
     struct extension_base_list extension_bases;
+#endif
     uint64_t *job_order;
     uint64_t job_count;
     uint64_t setup_nodes;
@@ -255,7 +261,9 @@ struct shared_state {
     pthread_cond_t event_condition;
     struct solution *solution_head;
     struct solution *solution_tail;
+#if RESIDUAL_EXTENSION
     struct solution_set extension_solutions;
+#endif
 };
 
 struct worker {
@@ -644,6 +652,7 @@ static bool initialize_targets(struct search *search)
     return true;
 }
 
+#if RESIDUAL_EXTENSION
 static void free_extension_bases(struct extension_base_list *bases)
 {
     uint64_t index;
@@ -655,7 +664,6 @@ static void free_extension_bases(struct extension_base_list *bases)
     *bases = (struct extension_base_list){0};
 }
 
-#if RESIDUAL_EXTENSION
 static bool canonicalize_extension_base(const char *text, size_t length,
                                         struct extension_base *base)
 {
@@ -904,6 +912,15 @@ static bool load_extension_bases(const char *path, const struct search *search,
     return true;
 }
 #endif
+
+static void free_shared_extension_bases(struct shared_state *shared)
+{
+#if RESIDUAL_EXTENSION
+    free_extension_bases(&shared->extension_bases);
+#else
+    (void)shared;
+#endif
+}
 
 static void subtract_prefix_owner(struct search *search, unsigned owner)
 {
@@ -1692,12 +1709,16 @@ static void free_solution_set(struct solution_set *set)
     free(set->slots);
     *set = (struct solution_set){0};
 }
-#else
-static void free_solution_set(struct solution_set *set)
-{
-    (void)set;
-}
 #endif
+
+static void free_shared_solution_set(struct shared_state *shared)
+{
+#if RESIDUAL_EXTENSION
+    free_solution_set(&shared->extension_solutions);
+#else
+    (void)shared;
+#endif
+}
 
 static bool record_configuration(struct search *search)
 {
@@ -2859,6 +2880,7 @@ int main(int argc, char **argv)
                 if (options.random_order) {
                     fprintf(stderr, ", seed=%" PRIu64, options.seed);
                 }
+#if RESIDUAL_EXTENSION
                 if (options.extend_solutions_path != NULL) {
                     fprintf(stderr, ", mode=extension, bases=%" PRIu64
                             ", positions-per-base=%u, input=%s",
@@ -2866,13 +2888,14 @@ int main(int argc, char **argv)
                             DICE,
                             options.extend_solutions_path);
                 }
+#endif
                 fputc('\n', stderr);
             } else {
                 fputs("Unable to build residual-search prefix jobs.\n",
                       stderr);
             }
             clear_prefixes(&shared.prefixes);
-            free_extension_bases(&shared.extension_bases);
+            free_shared_extension_bases(&shared);
             return interrupt_requested ? 128 + SIGINT : EXIT_FAILURE;
         }
     }
@@ -2893,7 +2916,7 @@ int main(int argc, char **argv)
         if (shared.job_count > SIZE_MAX / sizeof(*shared.job_order)) {
             fputs("Job-order table is too large.\n", stderr);
             clear_prefixes(&shared.prefixes);
-            free_extension_bases(&shared.extension_bases);
+            free_shared_extension_bases(&shared);
             return EXIT_FAILURE;
         }
         shared.job_order = malloc((size_t)shared.job_count *
@@ -2901,7 +2924,7 @@ int main(int argc, char **argv)
         if (shared.job_order == NULL) {
             fputs("Unable to allocate job-order table.\n", stderr);
             clear_prefixes(&shared.prefixes);
-            free_extension_bases(&shared.extension_bases);
+            free_shared_extension_bases(&shared);
             return EXIT_FAILURE;
         }
         for (uint64_t job = 0; job < shared.job_count; ++job) {
@@ -2923,7 +2946,7 @@ int main(int argc, char **argv)
         fputs("Unable to initialize solution mutex.\n", stderr);
         free(shared.job_order);
         clear_prefixes(&shared.prefixes);
-        free_extension_bases(&shared.extension_bases);
+        free_shared_extension_bases(&shared);
         return EXIT_FAILURE;
     }
     if (pthread_mutex_init(&shared.event_mutex, NULL) != 0) {
@@ -2931,7 +2954,7 @@ int main(int argc, char **argv)
         pthread_mutex_destroy(&shared.solution_mutex);
         free(shared.job_order);
         clear_prefixes(&shared.prefixes);
-        free_extension_bases(&shared.extension_bases);
+        free_shared_extension_bases(&shared);
         return EXIT_FAILURE;
     }
     if (pthread_cond_init(&shared.event_condition, NULL) != 0) {
@@ -2940,7 +2963,7 @@ int main(int argc, char **argv)
         pthread_mutex_destroy(&shared.solution_mutex);
         free(shared.job_order);
         clear_prefixes(&shared.prefixes);
-        free_extension_bases(&shared.extension_bases);
+        free_shared_extension_bases(&shared);
         return EXIT_FAILURE;
     }
     worker_count = options.threads;
@@ -2973,6 +2996,7 @@ int main(int argc, char **argv)
         atomic_init(&workers[worker].stats.left_end_prunes, 0);
     }
 
+#if RESIDUAL_EXTENSION
     if (options.extend_solutions_path != NULL) {
         fprintf(stderr,
                 "Extending %" PRIu64 " canonical %u-die bases",
@@ -3009,7 +3033,9 @@ int main(int argc, char **argv)
             fprintf(stderr, ", same-side-nonfair-skipped=%" PRIu64,
                     shared.extension_bases.same_side_nonfair_count);
         }
-    } else {
+    } else
+#endif
+    {
         fprintf(stderr,
                 "Searching essentially different %s%s%dd%d configurations "
                 "by residual-prefix search (%u states; %s; column-group=%d) "
@@ -3123,6 +3149,7 @@ int main(int argc, char **argv)
         if (options.random_order) {
             fprintf(stderr, ", seed=%" PRIu64, options.seed);
         }
+#if RESIDUAL_EXTENSION
         if (options.extend_solutions_path != NULL) {
             fprintf(stderr,
                     ", mode=extension, bases=%" PRIu64
@@ -3131,6 +3158,7 @@ int main(int argc, char **argv)
                     DICE,
                     options.extend_solutions_path);
         }
+#endif
         fprintf(stderr,
                 ", nodes=%s, negative-prunes=%s",
                 nodes, negative_prunes);
@@ -3157,8 +3185,8 @@ cleanup:
     free(workers);
     free(shared.job_order);
     clear_prefixes(&shared.prefixes);
-    free_extension_bases(&shared.extension_bases);
-    free_solution_set(&shared.extension_solutions);
+    free_shared_extension_bases(&shared);
+    free_shared_solution_set(&shared);
     pthread_cond_destroy(&shared.event_condition);
     pthread_mutex_destroy(&shared.event_mutex);
     pthread_mutex_destroy(&shared.solution_mutex);

@@ -658,7 +658,7 @@ static bool initialize_stages(struct search *search)
         stage->permutation_count = (unsigned)factorial;
         if (!integer_power(SIDES, dice, &outcomes)) {
             fprintf(stderr, "%u^%u exceeds the 64-bit counting range.\n",
-                    SIDES, dice);
+                    (unsigned)SIDES, dice);
             return false;
         }
         stage->possible = outcomes % factorial == 0;
@@ -2113,7 +2113,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Depth %u cannot be permutation-fair because %u^%u is "
                     "not divisible by %u!.\n",
-                    dice, SIDES, dice, dice);
+                    dice, (unsigned)SIDES, dice, dice);
         }
     }
 
