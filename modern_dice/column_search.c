@@ -56,6 +56,14 @@
 #define ADDITIVE_PERM_LINEAR 1
 #endif
 
+#ifndef ROW2_MITM
+#define ROW2_MITM 0
+#endif
+
+#ifndef ROW1_MITM
+#define ROW1_MITM 0
+#endif
+
 #if MIRROR != 0 && MIRROR != 1
 #error "MIRROR must be either 0 or 1"
 #endif
@@ -72,9 +80,30 @@
 #error "ADDITIVE_PERM_LINEAR must be either 0 or 1"
 #endif
 
+#if ROW2_MITM != 0 && ROW2_MITM != 1
+#error "ROW2_MITM must be either 0 or 1"
+#endif
+
+#if ROW1_MITM != 0 && ROW1_MITM != 1
+#error "ROW1_MITM must be either 0 or 1"
+#endif
+
+#if ROW2_MITM && \
+    ((DICE != 4 && DICE != 5) || MIRROR || !PERM_ONLY || SIDES > 30)
+#error "ROW2_MITM requires nonmirror DICE=4..5 PERM_ONLY=1 and SIDES<=30"
+#endif
+
+#if ROW1_MITM && \
+    (DICE != 4 || MIRROR || !PERM_ONLY || SIDES > 24 || !ROW2_MITM)
+#error "ROW1_MITM requires ROW2_MITM=1, nonmirror DICE=4 PERM_ONLY=1, and SIDES<=24"
+#endif
+
 #define ADDITIVE_PERM_BOUNDS_ACTIVE (PERM_ONLY && DICE >= 4)
 #define ADDITIVE_PERM_LINEAR_ACTIVE \
     (ADDITIVE_PERM_BOUNDS_ACTIVE && ADDITIVE_PERM_LINEAR)
+#define ROW2_MITM_ACTIVE \
+    (ROW2_MITM && (DICE == 4 || DICE == 5) && PERM_ONLY && !MIRROR)
+#define ROW1_MITM_ACTIVE (ROW1_MITM && ROW2_MITM_ACTIVE && SIDES <= 24)
 
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
@@ -92,6 +121,26 @@
 #define SEARCH_COLUMNS (SIDES / 2)
 #else
 #define SEARCH_COLUMNS SIDES
+#endif
+#if ROW2_MITM_ACTIVE
+#define ROW2_MITM_MAX_LEFT_VARIABLES ((SEARCH_COLUMNS + 1U) / 2U)
+#define ROW2_MITM_LEFT_CAPACITY (1U << ROW2_MITM_MAX_LEFT_VARIABLES)
+#define ROW2_MITM_HASH_CAPACITY (2U * ROW2_MITM_LEFT_CAPACITY)
+#if DICE == 4
+#define ROW2_MITM_VECTOR_WIDTH 8U
+#else
+#define ROW2_MITM_VECTOR_WIDTH 27U
+#endif
+#endif
+#if ROW1_MITM_ACTIVE
+#if SIDES <= 18
+#define ROW1_MITM_LEFT_CAPACITY 6561U /* 3^8 for noncanonical 4d18 */
+#define ROW1_MITM_HASH_CAPACITY 16384U
+#else
+#define ROW1_MITM_LEFT_CAPACITY 177147U /* 3^11 for noncanonical 4d24 */
+#define ROW1_MITM_HASH_CAPACITY 524288U
+#endif
+#define ROW1_MITM_VECTOR_WIDTH 4U
 #endif
 #define DEFAULT_PRINT_LIMIT UINT64_C(10)
 #define DEFAULT_PROGRESS_SECONDS UINT64_C(1)
@@ -179,6 +228,11 @@ _Static_assert(SOLUTION_FLUSH_THRESHOLD <= SOLUTION_QUEUE_CAPACITY,
                "solution flush threshold exceeds queue capacity");
 _Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
                "permutation state indices must fit in uint16_t");
+#if ROW2_MITM_ACTIVE
+_Static_assert(ROW2_MITM_VECTOR_WIDTH ==
+                   MAX_PREFIX_PERMUTATIONS - 1U + DICE - 1U,
+               "final-row MITM vector width is inconsistent");
+#endif
 
 struct options {
     uint64_t limit;
@@ -254,6 +308,22 @@ struct additive_perm_bounds {
 struct shared_state;
 struct worker_stats;
 
+#if ROW2_MITM_ACTIVE
+struct row2_mitm_entry {
+    uint64_t hash;
+    uint32_t choices;
+    uint32_t next;
+};
+#endif
+
+#if ROW1_MITM_ACTIVE
+struct row1_mitm_entry {
+    uint64_t hash;
+    uint32_t choices;
+    uint32_t next;
+};
+#endif
+
 struct search {
     /* Face labels are zero based internally. */
     unsigned grid[DICE][SIDES];
@@ -282,6 +352,14 @@ struct search {
                                   [PLACE_DIRECTION_COUNT];
     int64_t direction_maximum_left[DICE][SEARCH_COLUMNS + 1]
                                   [PLACE_DIRECTION_COUNT];
+#if ROW2_MITM_ACTIVE
+    struct row2_mitm_entry row2_mitm_entry[ROW2_MITM_LEFT_CAPACITY];
+    uint32_t row2_mitm_head[ROW2_MITM_HASH_CAPACITY];
+#endif
+#if ROW1_MITM_ACTIVE
+    struct row1_mitm_entry row1_mitm_entry[ROW1_MITM_LEFT_CAPACITY];
+    uint32_t row1_mitm_head[ROW1_MITM_HASH_CAPACITY];
+#endif
 #if PACKED_PAIR_WINS
     /* One byte-wide win counter per previous die, packed into a word. */
     uint64_t pair_wins[DICE];
@@ -305,6 +383,9 @@ struct search {
     struct worker_stats *published;
 
     uint64_t nodes;
+#if ROW2_MITM_ACTIVE
+    uint64_t mitm_states;
+#endif
     uint64_t bound_prunes;
     uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
@@ -322,6 +403,9 @@ struct search {
 
 struct worker_stats {
     atomic_uint_fast64_t nodes;
+#if ROW2_MITM_ACTIVE
+    atomic_uint_fast64_t mitm_states;
+#endif
     atomic_uint_fast64_t bound_prunes;
     atomic_uint_fast64_t linear_place_prunes;
     atomic_uint_fast64_t pair_bound_prunes;
@@ -412,7 +496,11 @@ static bool install_sigint_handler(void)
 
 static const char *traversal_description(void)
 {
-#if MIRROR
+#if ROW1_MITM_ACTIVE
+    return "fail-first first die; exact MITM final built dice";
+#elif ROW2_MITM_ACTIVE
+    return "fail-first; exact MITM final built die";
+#elif MIRROR
     return "fail-first; outer-pair ties first";
 #elif HIGH_FIRST
     return "fail-first; high-label ties first";
@@ -1014,6 +1102,7 @@ static bool build_contributions(struct search *search)
     }
     return true;
 }
+
 
 static void generate_perm_states(struct perm_counter *counter,
                                  unsigned target_length, unsigned depth,
@@ -1680,6 +1769,11 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
     }
 
     memset(bounds->tally[row], 0, sizeof(bounds->tally[row]));
+#if ROW2_MITM_ACTIVE
+    if (row == DICE - 2U && !search->template_active) {
+        return;
+    }
+#endif
     memset(bounds->minimum_left[row][SEARCH_COLUMNS], 0,
            sizeof(bounds->minimum_left[row][SEARCH_COLUMNS]));
     memset(bounds->maximum_left[row][SEARCH_COLUMNS], 0,
@@ -2154,6 +2248,21 @@ static void plan_column_order(struct search *search, unsigned row)
     }
 }
 
+#if ROW2_MITM_ACTIVE
+static void prepare_mitm_columns(struct search *search, unsigned row)
+{
+    unsigned column;
+
+    reset_column_order(search, row);
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = ordered_column(search, row, column);
+
+        search->candidate_mask[row][column] = available_candidate_mask(
+            search, row, actual_column, column == 0);
+    }
+}
+#endif
+
 /* Build independent min/max suffix bounds for one die being filled. */
 static void build_bounds(struct search *search, unsigned row)
 {
@@ -2294,6 +2403,7 @@ static void build_bounds(struct search *search, unsigned row)
 #endif
 
 }
+
 
 static bool bounds_allow_goal(const struct search *search,
                               unsigned row, unsigned column)
@@ -2554,6 +2664,10 @@ static void publish_worker_stats(struct search *search)
 {
     atomic_store_explicit(&search->published->nodes, search->nodes,
                           memory_order_relaxed);
+#if ROW2_MITM_ACTIVE
+    atomic_store_explicit(&search->published->mitm_states,
+                          search->mitm_states, memory_order_relaxed);
+#endif
     atomic_store_explicit(&search->published->bound_prunes,
                           search->bound_prunes, memory_order_relaxed);
     atomic_store_explicit(&search->published->linear_place_prunes,
@@ -2847,6 +2961,575 @@ static bool completed_row_is_fair(struct search *search, unsigned row)
     return true;
 }
 
+#if ROW2_MITM_ACTIVE
+static uint64_t mitm_hash_coefficient(unsigned coordinate)
+{
+    uint64_t value = (uint64_t)(coordinate + 1U) *
+        UINT64_C(0x9e3779b97f4a7c15);
+
+    value = (value ^ (value >> 30U)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27U)) * UINT64_C(0x94d049bb133111eb);
+    return (value ^ (value >> 31U)) | UINT64_C(1);
+}
+
+static uint64_t row2_mitm_vector_hash(
+    const int64_t vector[ROW2_MITM_VECTOR_WIDTH])
+{
+    uint64_t hash = 0;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < ROW2_MITM_VECTOR_WIDTH;
+         ++coordinate) {
+        hash += (uint64_t)vector[coordinate] *
+            mitm_hash_coefficient(coordinate);
+    }
+    return hash;
+}
+
+static void row2_choice_vector(const struct search *search, unsigned row,
+                               unsigned column, unsigned candidate,
+                               int64_t vector[ROW2_MITM_VECTOR_WIDTH])
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    unsigned actual_column = ordered_column(search, row, column);
+    unsigned permutation_count = bounds->permutation_count[row];
+    unsigned permutation_coordinates = permutation_count - 1U;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < permutation_coordinates;
+         ++coordinate) {
+        vector[coordinate] = (int64_t)additive_perm_contribution_at(
+            search, bounds, row, candidate, actual_column, coordinate);
+    }
+    for (coordinate = 0; coordinate < DICE - 1U; ++coordinate) {
+        vector[permutation_coordinates + coordinate] =
+            (int64_t)choice_contribution(
+                search, row, candidate, column, coordinate);
+    }
+}
+
+/*
+ * Solve the final binary row as an exact meet-in-the-middle join.  A linear
+ * 64-bit fingerprint is only an index: every hash hit is verified against
+ * all exact coordinates, so collisions can add work but never affect
+ * correctness.
+ */
+static void solve_row2_meet_in_middle(struct search *search, unsigned row)
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    unsigned base_candidate[SEARCH_COLUMNS];
+    unsigned alternate_candidate[SEARCH_COLUMNS];
+    unsigned variable_position[SEARCH_COLUMNS];
+    int64_t delta[SEARCH_COLUMNS][ROW2_MITM_VECTOR_WIDTH];
+    uint64_t delta_hash[SEARCH_COLUMNS];
+    int64_t base[ROW2_MITM_VECTOR_WIDTH] = {0};
+    int64_t target[ROW2_MITM_VECTOR_WIDTH];
+    int64_t target_delta[ROW2_MITM_VECTOR_WIDTH];
+    unsigned variable_count = 0;
+    unsigned left_variables;
+    unsigned right_variables;
+    uint32_t left_count;
+    uint32_t right_count;
+    unsigned column;
+    unsigned permutation_coordinates =
+        bounds->permutation_count[row] - 1U;
+    unsigned coordinate;
+    uint64_t target_hash;
+
+    for (coordinate = 0; coordinate < permutation_coordinates;
+         ++coordinate) {
+        target[coordinate] = (int64_t)bounds->goal[row];
+    }
+    for (coordinate = permutation_coordinates;
+         coordinate < ROW2_MITM_VECTOR_WIDTH;
+         ++coordinate) {
+        target[coordinate] = (int64_t)search->place_goal;
+    }
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned candidates = search->candidate_mask[row][column];
+        unsigned first;
+        int64_t first_vector[ROW2_MITM_VECTOR_WIDTH];
+
+        if (candidates == 0) {
+            return;
+        }
+        first = (unsigned)__builtin_ctz(candidates);
+        candidates &= candidates - 1U;
+        base_candidate[column] = first;
+        alternate_candidate[column] = first;
+        row2_choice_vector(search, row, column, first, first_vector);
+        for (coordinate = 0; coordinate < ROW2_MITM_VECTOR_WIDTH;
+             ++coordinate) {
+            base[coordinate] += first_vector[coordinate];
+        }
+        if (candidates != 0) {
+            unsigned second = (unsigned)__builtin_ctz(candidates);
+            int64_t second_vector[ROW2_MITM_VECTOR_WIDTH];
+
+            if ((candidates & (candidates - 1U)) != 0) {
+                return;
+            }
+            alternate_candidate[column] = second;
+            variable_position[variable_count] = column;
+            row2_choice_vector(search, row, column, second, second_vector);
+            for (coordinate = 0; coordinate < ROW2_MITM_VECTOR_WIDTH;
+                 ++coordinate) {
+                delta[variable_count][coordinate] =
+                    second_vector[coordinate] - first_vector[coordinate];
+            }
+            delta_hash[variable_count] =
+                row2_mitm_vector_hash(delta[variable_count]);
+            ++variable_count;
+        }
+    }
+    left_variables = variable_count / 2U;
+    right_variables = variable_count - left_variables;
+    if (left_variables > ROW2_MITM_MAX_LEFT_VARIABLES ||
+        right_variables > ROW2_MITM_MAX_LEFT_VARIABLES) {
+        return;
+    }
+    left_count = UINT32_C(1) << left_variables;
+    right_count = UINT32_C(1) << right_variables;
+    search->mitm_states += (uint64_t)left_count + right_count;
+    memset(search->row2_mitm_head, 0xff, sizeof(search->row2_mitm_head));
+    {
+        uint64_t current_hash = 0;
+        uint32_t previous_gray = 0;
+        uint32_t ordinal;
+
+        for (ordinal = 0; ordinal < left_count; ++ordinal) {
+            uint32_t gray = ordinal ^ (ordinal >> 1U);
+            uint32_t bucket;
+            struct row2_mitm_entry *entry =
+                &search->row2_mitm_entry[ordinal];
+
+            if (ordinal != 0) {
+                uint32_t changed = gray ^ previous_gray;
+                unsigned variable = (unsigned)__builtin_ctz(changed);
+
+                if ((gray & changed) != 0) {
+                    current_hash += delta_hash[variable];
+                } else {
+                    current_hash -= delta_hash[variable];
+                }
+            }
+            bucket = (uint32_t)current_hash &
+                (ROW2_MITM_HASH_CAPACITY - 1U);
+            entry->hash = current_hash;
+            entry->choices = gray;
+            entry->next = search->row2_mitm_head[bucket];
+            search->row2_mitm_head[bucket] = ordinal;
+            previous_gray = gray;
+        }
+    }
+    for (coordinate = 0; coordinate < ROW2_MITM_VECTOR_WIDTH;
+         ++coordinate) {
+        target_delta[coordinate] = target[coordinate] - base[coordinate];
+    }
+    target_hash = row2_mitm_vector_hash(target_delta);
+    {
+        uint64_t right_hash = 0;
+        uint32_t previous_gray = 0;
+        uint32_t ordinal;
+
+        for (ordinal = 0; ordinal < right_count; ++ordinal) {
+            uint32_t right_gray = ordinal ^ (ordinal >> 1U);
+            uint64_t needed_hash;
+            uint32_t entry_index;
+
+            if (ordinal != 0) {
+                uint32_t changed = right_gray ^ previous_gray;
+                unsigned variable = left_variables +
+                    (unsigned)__builtin_ctz(changed);
+
+                if ((right_gray & changed) != 0) {
+                    right_hash += delta_hash[variable];
+                } else {
+                    right_hash -= delta_hash[variable];
+                }
+            }
+            needed_hash = target_hash - right_hash;
+            entry_index = search->row2_mitm_head[
+                (uint32_t)needed_hash & (ROW2_MITM_HASH_CAPACITY - 1U)];
+            while (entry_index != UINT32_MAX) {
+                const struct row2_mitm_entry *entry =
+                    &search->row2_mitm_entry[entry_index];
+
+                if (entry->hash == needed_hash) {
+                    int64_t total[ROW2_MITM_VECTOR_WIDTH];
+                    unsigned variable;
+                    bool exact = true;
+
+                    memcpy(total, base, sizeof(total));
+                    for (variable = 0; variable < left_variables;
+                         ++variable) {
+                        if ((entry->choices & (1U << variable)) != 0) {
+                            for (coordinate = 0;
+                                 coordinate < ROW2_MITM_VECTOR_WIDTH;
+                                 ++coordinate) {
+                                total[coordinate] +=
+                                    delta[variable][coordinate];
+                            }
+                        }
+                    }
+                    for (variable = 0; variable < right_variables;
+                         ++variable) {
+                        if ((right_gray & (1U << variable)) != 0) {
+                            unsigned index = left_variables + variable;
+
+                            for (coordinate = 0;
+                                 coordinate < ROW2_MITM_VECTOR_WIDTH;
+                                 ++coordinate) {
+                                total[coordinate] +=
+                                    delta[index][coordinate];
+                            }
+                        }
+                    }
+                    for (coordinate = 0;
+                         coordinate < ROW2_MITM_VECTOR_WIDTH; ++coordinate) {
+                        if (total[coordinate] != target[coordinate]) {
+                            exact = false;
+                            break;
+                        }
+                    }
+                    if (exact) {
+                        unsigned selected[SEARCH_COLUMNS];
+
+                        memcpy(selected, base_candidate, sizeof(selected));
+                        for (variable = 0; variable < left_variables;
+                             ++variable) {
+                            if ((entry->choices & (1U << variable)) != 0) {
+                                unsigned position =
+                                    variable_position[variable];
+
+                                selected[position] =
+                                    alternate_candidate[position];
+                            }
+                        }
+                        for (variable = 0; variable < right_variables;
+                             ++variable) {
+                            if ((right_gray & (1U << variable)) != 0) {
+                                unsigned position = variable_position[
+                                    left_variables + variable];
+
+                                selected[position] =
+                                    alternate_candidate[position];
+                            }
+                        }
+                        for (column = 0; column < SEARCH_COLUMNS; ++column) {
+                            apply_choice(
+                                search, row, column, selected[column]);
+                        }
+                        if (completed_row_is_fair(search, row)) {
+                            accept_configuration(search);
+                        }
+                        column = SEARCH_COLUMNS;
+                        while (column-- > 0) {
+                            undo_choice(
+                                search, row, column, selected[column]);
+                        }
+                        if (atomic_load_explicit(
+                                &search->shared->stop,
+                                memory_order_relaxed)) {
+                            return;
+                        }
+                    }
+                }
+                entry_index = entry->next;
+            }
+            previous_gray = right_gray;
+        }
+    }
+}
+#endif
+
+#if ROW1_MITM_ACTIVE
+static void search_row(struct search *search, unsigned row, unsigned column);
+
+static uint64_t row1_mitm_vector_hash(
+    const int64_t vector[ROW1_MITM_VECTOR_WIDTH])
+{
+    uint64_t hash = 0;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < ROW1_MITM_VECTOR_WIDTH;
+         ++coordinate) {
+        hash += (uint64_t)vector[coordinate] *
+            mitm_hash_coefficient(coordinate);
+    }
+    return hash;
+}
+
+static void row1_choice_vector(const struct search *search, unsigned row,
+                               unsigned column, unsigned candidate,
+                               int64_t vector[ROW1_MITM_VECTOR_WIDTH])
+{
+    unsigned actual_column = ordered_column(search, row, column);
+    unsigned place;
+
+    vector[0] = search->grid[candidate][actual_column] >
+        search->grid[0][actual_column];
+    for (place = 0; place < 3U; ++place) {
+        vector[place + 1U] = (int64_t)choice_contribution(
+            search, row, candidate, column, place);
+    }
+}
+
+static void solve_row1_meet_in_middle(struct search *search, unsigned row)
+{
+    unsigned base_candidate[SEARCH_COLUMNS];
+    unsigned variable_position[SEARCH_COLUMNS];
+    unsigned option_candidate[SEARCH_COLUMNS][3];
+    unsigned option_count[SEARCH_COLUMNS];
+    int64_t delta[SEARCH_COLUMNS][3][ROW1_MITM_VECTOR_WIDTH];
+    uint64_t delta_hash[SEARCH_COLUMNS][3];
+    int64_t base[ROW1_MITM_VECTOR_WIDTH] = {0};
+    int64_t target[ROW1_MITM_VECTOR_WIDTH] = {
+        SIDES / 2U, search->place_goal, search->place_goal,
+        search->place_goal,
+    };
+    int64_t target_delta[ROW1_MITM_VECTOR_WIDTH];
+    unsigned variable_count = 0;
+    unsigned left_variables;
+    unsigned right_variables;
+    uint32_t left_count = 1;
+    uint32_t right_count = 1;
+    uint64_t target_hash;
+    unsigned column;
+    unsigned coordinate;
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned candidates = search->candidate_mask[row][column];
+        unsigned first;
+        int64_t first_vector[ROW1_MITM_VECTOR_WIDTH];
+
+        if (candidates == 0) {
+            return;
+        }
+        first = (unsigned)__builtin_ctz(candidates);
+        candidates &= candidates - 1U;
+        base_candidate[column] = first;
+        row1_choice_vector(search, row, column, first, first_vector);
+        for (coordinate = 0; coordinate < ROW1_MITM_VECTOR_WIDTH;
+             ++coordinate) {
+            base[coordinate] += first_vector[coordinate];
+        }
+        if (candidates != 0) {
+            unsigned count = 1;
+
+            variable_position[variable_count] = column;
+            option_candidate[variable_count][0] = first;
+            memset(delta[variable_count][0], 0,
+                   sizeof(delta[variable_count][0]));
+            delta_hash[variable_count][0] = 0;
+            while (candidates != 0 && count < 3U) {
+                unsigned candidate = (unsigned)__builtin_ctz(candidates);
+                int64_t vector[ROW1_MITM_VECTOR_WIDTH];
+
+                candidates &= candidates - 1U;
+                option_candidate[variable_count][count] = candidate;
+                row1_choice_vector(
+                    search, row, column, candidate, vector);
+                for (coordinate = 0;
+                     coordinate < ROW1_MITM_VECTOR_WIDTH; ++coordinate) {
+                    delta[variable_count][count][coordinate] =
+                        vector[coordinate] - first_vector[coordinate];
+                }
+                delta_hash[variable_count][count] =
+                    row1_mitm_vector_hash(delta[variable_count][count]);
+                ++count;
+            }
+            if (candidates != 0) {
+                return;
+            }
+            option_count[variable_count] = count;
+            ++variable_count;
+        }
+    }
+    left_variables = variable_count / 2U;
+    right_variables = variable_count - left_variables;
+    for (column = 0; column < left_variables; ++column) {
+        left_count *= option_count[column];
+    }
+    for (column = left_variables; column < variable_count; ++column) {
+        right_count *= option_count[column];
+    }
+    if (left_count > ROW1_MITM_LEFT_CAPACITY ||
+        left_count * 2U > ROW1_MITM_HASH_CAPACITY) {
+        return;
+    }
+    search->mitm_states += (uint64_t)left_count + right_count;
+    memset(search->row1_mitm_head, 0xff, sizeof(search->row1_mitm_head));
+    {
+        unsigned digit[SEARCH_COLUMNS] = {0};
+        uint32_t packed = 0;
+        uint64_t current_hash = 0;
+        uint32_t ordinal;
+
+        for (ordinal = 0; ordinal < left_count; ++ordinal) {
+            uint32_t bucket = (uint32_t)current_hash &
+                (ROW1_MITM_HASH_CAPACITY - 1U);
+            struct row1_mitm_entry *entry =
+                &search->row1_mitm_entry[ordinal];
+
+            entry->hash = current_hash;
+            entry->choices = packed;
+            entry->next = search->row1_mitm_head[bucket];
+            search->row1_mitm_head[bucket] = ordinal;
+            if (ordinal + 1U < left_count) {
+                unsigned variable = 0;
+
+                for (;;) {
+                    unsigned old = digit[variable];
+                    unsigned next = old + 1U;
+
+                    current_hash -= delta_hash[variable][old];
+                    if (next == option_count[variable]) {
+                        next = 0;
+                    }
+                    digit[variable] = next;
+                    current_hash += delta_hash[variable][next];
+                    packed &= ~(UINT32_C(3) << (2U * variable));
+                    packed |= (uint32_t)next << (2U * variable);
+                    if (next != 0) {
+                        break;
+                    }
+                    ++variable;
+                }
+            }
+        }
+    }
+    for (coordinate = 0; coordinate < ROW1_MITM_VECTOR_WIDTH;
+         ++coordinate) {
+        target_delta[coordinate] = target[coordinate] - base[coordinate];
+    }
+    target_hash = row1_mitm_vector_hash(target_delta);
+    {
+        unsigned digit[SEARCH_COLUMNS] = {0};
+        uint32_t packed = 0;
+        uint64_t current_hash = 0;
+        uint32_t ordinal;
+
+        for (ordinal = 0; ordinal < right_count; ++ordinal) {
+            uint64_t needed_hash = target_hash - current_hash;
+            uint32_t entry_index = search->row1_mitm_head[
+                (uint32_t)needed_hash & (ROW1_MITM_HASH_CAPACITY - 1U)];
+
+            while (entry_index != UINT32_MAX) {
+                const struct row1_mitm_entry *entry =
+                    &search->row1_mitm_entry[entry_index];
+
+                if (entry->hash == needed_hash) {
+                    int64_t total[ROW1_MITM_VECTOR_WIDTH];
+                    unsigned variable;
+                    bool exact = true;
+
+                    memcpy(total, base, sizeof(total));
+                    for (variable = 0; variable < left_variables;
+                         ++variable) {
+                        unsigned choice = (entry->choices >>
+                            (2U * variable)) & 3U;
+
+                        for (coordinate = 0;
+                             coordinate < ROW1_MITM_VECTOR_WIDTH;
+                             ++coordinate) {
+                            total[coordinate] +=
+                                delta[variable][choice][coordinate];
+                        }
+                    }
+                    for (variable = 0; variable < right_variables;
+                         ++variable) {
+                        unsigned choice = (packed >> (2U * variable)) & 3U;
+                        unsigned index = left_variables + variable;
+
+                        for (coordinate = 0;
+                             coordinate < ROW1_MITM_VECTOR_WIDTH;
+                             ++coordinate) {
+                            total[coordinate] +=
+                                delta[index][choice][coordinate];
+                        }
+                    }
+                    for (coordinate = 0;
+                         coordinate < ROW1_MITM_VECTOR_WIDTH; ++coordinate) {
+                        if (total[coordinate] != target[coordinate]) {
+                            exact = false;
+                            break;
+                        }
+                    }
+                    if (exact) {
+                        unsigned selected[SEARCH_COLUMNS];
+
+                        memcpy(selected, base_candidate, sizeof(selected));
+                        for (variable = 0; variable < left_variables;
+                             ++variable) {
+                            unsigned choice = (entry->choices >>
+                                (2U * variable)) & 3U;
+                            unsigned position =
+                                variable_position[variable];
+
+                            selected[position] =
+                                option_candidate[variable][choice];
+                        }
+                        for (variable = 0; variable < right_variables;
+                             ++variable) {
+                            unsigned choice = (packed >>
+                                (2U * variable)) & 3U;
+                            unsigned index = left_variables + variable;
+                            unsigned position = variable_position[index];
+
+                            selected[position] =
+                                option_candidate[index][choice];
+                        }
+                        for (column = 0; column < SEARCH_COLUMNS; ++column) {
+                            apply_choice(
+                                search, row, column, selected[column]);
+                        }
+                        if (completed_row_is_fair(search, row)) {
+                            search_row(search, row + 1U, 0);
+                        }
+                        column = SEARCH_COLUMNS;
+                        while (column-- > 0) {
+                            undo_choice(
+                                search, row, column, selected[column]);
+                        }
+                        if (atomic_load_explicit(
+                                &search->shared->stop,
+                                memory_order_relaxed)) {
+                            return;
+                        }
+                    }
+                }
+                entry_index = entry->next;
+            }
+            if (ordinal + 1U < right_count) {
+                unsigned local = 0;
+
+                for (;;) {
+                    unsigned variable = left_variables + local;
+                    unsigned old = digit[local];
+                    unsigned next = old + 1U;
+
+                    current_hash -= delta_hash[variable][old];
+                    if (next == option_count[variable]) {
+                        next = 0;
+                    }
+                    digit[local] = next;
+                    current_hash += delta_hash[variable][next];
+                    packed &= ~(UINT32_C(3) << (2U * local));
+                    packed |= (uint32_t)next << (2U * local);
+                    if (next != 0) {
+                        break;
+                    }
+                    ++local;
+                }
+            }
+        }
+    }
+}
+#endif
+
 /*
  * Fill one die in its planned column order.  Each branch swaps one face into
  * place, recurses, then restores that swap and its additive tallies.  There
@@ -2867,9 +3550,33 @@ static void search_row(struct search *search, unsigned row, unsigned column)
     }
 
     if (column == 0) {
-        plan_column_order(search, row);
-        build_bounds(search, row);
+#if ROW2_MITM_ACTIVE
+        if ((row == DICE - 2U
+#if ROW1_MITM_ACTIVE
+             || row == 1U
+#endif
+            ) && !search->template_active) {
+            prepare_mitm_columns(search, row);
+        } else
+#endif
+        {
+            plan_column_order(search, row);
+            build_bounds(search, row);
+        }
     }
+#if ROW1_MITM_ACTIVE
+    if (row == 1U && column == 0 && !search->template_active) {
+        solve_row1_meet_in_middle(search, row);
+        return;
+    }
+#endif
+#if ROW2_MITM_ACTIVE
+    if (row == DICE - 2U && column == 0 && !search->template_active) {
+        build_additive_perm_bounds(search, row);
+        solve_row2_meet_in_middle(search, row);
+        return;
+    }
+#endif
 #if !MIRROR
     if (row != 0 && column == PAIR_BOUND_START) {
         initialize_pair_wins(search, row, column);
@@ -2902,7 +3609,6 @@ static void search_row(struct search *search, unsigned row, unsigned column)
     }
 #endif
 #endif
-
     if (column == SEARCH_COLUMNS) {
         if (!completed_row_is_fair(search, row)) {
 #if !PERM_ONLY
@@ -3062,6 +3768,9 @@ static bool initialize_search(struct search *search,
 
 struct totals {
     uint64_t nodes;
+#if ROW2_MITM_ACTIVE
+    uint64_t mitm_states;
+#endif
     uint64_t bound_prunes;
     uint64_t linear_place_prunes;
     uint64_t pair_bound_prunes;
@@ -3144,6 +3853,10 @@ static struct totals collect_totals(const struct worker *workers,
     for (i = 0; i < thread_count; ++i) {
         totals.nodes += atomic_load_explicit(&workers[i].stats.nodes,
                                              memory_order_relaxed);
+#if ROW2_MITM_ACTIVE
+        totals.mitm_states += atomic_load_explicit(
+            &workers[i].stats.mitm_states, memory_order_relaxed);
+#endif
         totals.bound_prunes += atomic_load_explicit(
             &workers[i].stats.bound_prunes, memory_order_relaxed);
         totals.linear_place_prunes += atomic_load_explicit(
@@ -3382,6 +4095,9 @@ static void print_progress(const struct shared_state *shared,
     uint64_t permutation_total = atomic_load_explicit(
         &shared->permutation_total, memory_order_relaxed);
     char nodes[SI_COUNT_TEXT_SIZE];
+#if ROW2_MITM_ACTIVE
+    char mitm_states[SI_COUNT_TEXT_SIZE];
+#endif
     char bound_prunes[SI_COUNT_TEXT_SIZE];
     char linear_place_prunes[SI_COUNT_TEXT_SIZE];
     char pair_bound_prunes[SI_COUNT_TEXT_SIZE];
@@ -3400,6 +4116,9 @@ static void print_progress(const struct shared_state *shared,
 #endif
 
     format_si_count(nodes, totals.nodes);
+#if ROW2_MITM_ACTIVE
+    format_si_count(mitm_states, totals.mitm_states);
+#endif
     format_si_count(bound_prunes, totals.bound_prunes);
     format_si_count(linear_place_prunes, totals.linear_place_prunes);
     format_si_count(pair_bound_prunes, totals.pair_bound_prunes);
@@ -3418,8 +4137,13 @@ static void print_progress(const struct shared_state *shared,
 
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
-            " nodes=%s place-pruned=%s"
+            " nodes=%s"
+#if ROW2_MITM_ACTIVE
+            " mitm-states=%s"
+#endif
+            " place-pruned=%s"
             " linear-place-pruned=%s"
+#if !ROW1_MITM_ACTIVE
             " pair-pruned=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             " additive-perm-pruned=%s"
@@ -3431,10 +4155,17 @@ static void print_progress(const struct shared_state *shared,
             " all-subset-place-pruned=%s"
             " all-subset-place-fair=%s"
 #endif
+#endif
             " permutation-fair=%s\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
-            shared->job_count, nodes, bound_prunes,
-            linear_place_prunes, pair_bound_prunes,
+            shared->job_count, nodes,
+#if ROW2_MITM_ACTIVE
+            mitm_states,
+#endif
+            bound_prunes,
+            linear_place_prunes,
+#if !ROW1_MITM_ACTIVE
+            pair_bound_prunes,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             additive_perm_prunes,
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -3444,6 +4175,7 @@ static void print_progress(const struct shared_state *shared,
             prefix_place_prunes,
             all_subset_place_prunes,
             all_subset_place_fair,
+#endif
 #endif
             permutation_fair);
     fflush(stderr);
@@ -3702,6 +4434,9 @@ int main(int argc, char **argv)
         workers[i].search.shared = &shared;
         workers[i].search.published = &workers[i].stats;
         atomic_init(&workers[i].stats.nodes, 0);
+#if ROW2_MITM_ACTIVE
+        atomic_init(&workers[i].stats.mitm_states, 0);
+#endif
         atomic_init(&workers[i].stats.bound_prunes, 0);
         atomic_init(&workers[i].stats.linear_place_prunes, 0);
         atomic_init(&workers[i].stats.pair_bound_prunes, 0);
@@ -3822,6 +4557,9 @@ int main(int argc, char **argv)
                 !hit_limit && !sigint_requested;
             bool search_failed;
             char nodes[SI_COUNT_TEXT_SIZE];
+#if ROW2_MITM_ACTIVE
+            char mitm_states[SI_COUNT_TEXT_SIZE];
+#endif
             char node_rate[SI_COUNT_TEXT_SIZE];
             char bound_prunes[SI_COUNT_TEXT_SIZE];
             char linear_place_prunes[SI_COUNT_TEXT_SIZE];
@@ -3841,6 +4579,9 @@ int main(int argc, char **argv)
 #endif
 
             format_si_count(nodes, totals.nodes);
+#if ROW2_MITM_ACTIVE
+            format_si_count(mitm_states, totals.mitm_states);
+#endif
             format_si_count(node_rate, rounded_nodes_per_second);
             format_si_count(bound_prunes, totals.bound_prunes);
             format_si_count(linear_place_prunes,
@@ -3909,8 +4650,13 @@ int main(int argc, char **argv)
 
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
-                    ", nodes=%s (%s/s), place-pruned=%s"
+                    ", nodes=%s (%s/s)"
+#if ROW2_MITM_ACTIVE
+                    ", mitm-states=%s"
+#endif
+                    ", place-pruned=%s"
                     ", linear-place-prunes=%s"
+#if !ROW1_MITM_ACTIVE
                     ", pair-pruned=%s"
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     ", additive-perm-prunes=%s"
@@ -3922,6 +4668,7 @@ int main(int argc, char **argv)
                     ", all-subset-place-prunes=%s"
                     ", all-subset-place-fair=%s"
 #endif
+#endif
                     ", permutation-fair=%s\n",
                     sigint_requested ? "interrupted" :
                         (search_failed ? "failed" :
@@ -3930,7 +4677,11 @@ int main(int argc, char **argv)
                     shared.thread_count,
                     jobs_done,
                     shared.job_count, nodes, node_rate,
+#if ROW2_MITM_ACTIVE
+                    mitm_states,
+#endif
                     bound_prunes, linear_place_prunes,
+#if !ROW1_MITM_ACTIVE
                     pair_bound_prunes,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     additive_perm_prunes,
@@ -3941,6 +4692,7 @@ int main(int argc, char **argv)
                     prefix_place_prunes,
                     all_subset_place_prunes,
                     all_subset_place_fair,
+#endif
 #endif
                     permutation_fair);
         }

@@ -8,6 +8,9 @@ COLUMN_GROUP ?= 0
 HIGH_FIRST ?= 1
 PERM_ONLY ?= 0
 PERM_LINEAR ?= 1
+# Exact additive row joins: both late rows for 4 dice, final built row for 5.
+ROW_MITM ?= 0
+ROW1_MITM ?= $(if $(filter 4,$(DICE)),$(ROW_MITM),0)
 LINEAR_STRIDE ?= 2
 PERM_LINEAR_STRIDE ?= 3
 RESIDUAL_RIGHT_END ?= 1
@@ -19,6 +22,7 @@ PGO_RUN_ARGS ?= --quiet --threads 1 --jobs 256 --random-order --seed 1
 CPPFLAGS += -DDICE=$(DICE) -DSIDES=$(SIDES) -DMIRROR=$(MIRROR) \
 	-DHIGH_FIRST=$(HIGH_FIRST) -DPERM_ONLY=$(PERM_ONLY) \
 	-DADDITIVE_PERM_LINEAR=$(PERM_LINEAR) \
+	-DROW2_MITM=$(ROW_MITM) -DROW1_MITM=$(ROW1_MITM) \
 	-DLINEAR_BOUND_STRIDE=$(LINEAR_STRIDE) \
 	-DADDITIVE_PERM_LINEAR_BOUND_STRIDE=$(PERM_LINEAR_STRIDE)
 CFLAGS ?= -O3 -march=native -flto
@@ -59,7 +63,8 @@ define build_with_pgo
 	trap cleanup EXIT; \
 	trap 'exit 130' HUP INT TERM; \
 	echo "Building instrumented $(1)" \
-		"(DICE=$(DICE), SIDES=$(SIDES), PERM_ONLY=$(PERM_ONLY))"; \
+		"(DICE=$(DICE), SIDES=$(SIDES), PERM_ONLY=$(PERM_ONLY)," \
+		"ROW_MITM=$(ROW_MITM))"; \
 	$(PGO_CC) $(CPPFLAGS) $(3) $(CFLAGS) \
 		-fprofile-generate="$$pgo_dir" -fprofile-update=atomic \
 		-o $(1) $(2) $(LDLIBS); \
