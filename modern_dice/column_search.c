@@ -98,7 +98,9 @@
 #define PROGRESS_CHECK_MASK UINT64_C(0x3ffff)
 #define JOBS_PER_WORKER UINT64_C(8)
 #define MAX_THREADS 256U
-#define SOLUTION_QUEUE_CAPACITY 256U
+#define SOLUTION_QUEUE_CAPACITY 16384U
+#define SOLUTION_FLUSH_THRESHOLD 256U
+#define SOLUTION_RECORD_CAPACITY (FACE_COUNT + 128U)
 #define TEMPLATE_UNASSIGNED UINT8_MAX
 #ifndef PAIR_BOUND_START
 #if PACKED_PAIR_WINS
@@ -173,6 +175,8 @@ _Static_assert(LINEAR_BOUND_STRIDE > 0,
                "LINEAR_BOUND_STRIDE must be positive");
 _Static_assert(ADDITIVE_PERM_LINEAR_BOUND_STRIDE > 0,
                "ADDITIVE_PERM_LINEAR_BOUND_STRIDE must be positive");
+_Static_assert(SOLUTION_FLUSH_THRESHOLD <= SOLUTION_QUEUE_CAPACITY,
+               "solution flush threshold exceeds queue capacity");
 _Static_assert(PERM_STATE_COUNT <= UINT16_MAX,
                "permutation state indices must fit in uint16_t");
 
@@ -368,9 +372,9 @@ struct shared_state {
 
     pthread_mutex_t solution_mutex;
     pthread_cond_t solution_not_full;
-    struct solution solution_queue[SOLUTION_QUEUE_CAPACITY];
-    unsigned solution_head;
-    unsigned solution_tail;
+    struct solution *solution_queue;
+    struct solution *solution_batch;
+    char *solution_write_buffer;
     unsigned solution_count;
     bool solution_file_failed;
 };
@@ -425,6 +429,8 @@ static void usage(FILE *stream, const char *program)
             "Search the compile-time-selected %s%dd%d column-grouped space.\n"
             "Without a template, the first searched column removes equivalent "
             "die renamings.\n"
+            "Reported encodings are relabeled canonically so their first "
+            "column is in ABC... order.\n"
 #if PERM_ONLY
             "This build searches only for permutation-fair results and uses "
             "incremental prefix-permutation bounds.\n"
@@ -2594,38 +2600,67 @@ static void record_solution(struct search *search, enum solution_kind kind)
         ? &shared->all_subset_total
         : &shared->permutation_total;
     uint64_t number;
+    unsigned canonical_die[DICE];
     unsigned face;
-    bool enqueued = false;
+    bool flush_ready = false;
+
+    /* Suppressed results need only the final atomic accounting update. */
+    if (shared->options.solutions_path == NULL &&
+        atomic_load_explicit(total, memory_order_relaxed) >=
+            shared->options.print_limit) {
+        atomic_fetch_add_explicit(total, 1, memory_order_relaxed);
+        return;
+    }
 
     pthread_mutex_lock(&shared->solution_mutex);
+    while (shared->solution_count == SOLUTION_QUEUE_CAPACITY) {
+        pthread_cond_wait(&shared->solution_not_full,
+                          &shared->solution_mutex);
+    }
     number = atomic_fetch_add_explicit(total, 1,
                                        memory_order_relaxed) + 1U;
-    if (number <= shared->options.print_limit ||
-        shared->options.solutions_path != NULL) {
-        struct solution *solution;
+    if (number > shared->options.print_limit &&
+        shared->options.solutions_path == NULL) {
+        pthread_mutex_unlock(&shared->solution_mutex);
+        return;
+    }
 
-        while (shared->solution_count == SOLUTION_QUEUE_CAPACITY) {
-            pthread_cond_wait(&shared->solution_not_full,
-                              &shared->solution_mutex);
-        }
-        solution = &shared->solution_queue[shared->solution_tail];
+    /*
+     * Search-order symmetry breaking may fix a physical column other than
+     * column zero.  Relabel only the reported result so its first physical
+     * column is always ABC..., independent of traversal order and templates.
+     * owner[0..DICE-1] is a permutation, so it directly defines the map from
+     * internal search rows to canonical output labels.
+     */
+    for (face = 0; face < DICE; ++face) {
+        canonical_die[search->owner[face]] = face;
+    }
+    {
+        struct solution *solution =
+            &shared->solution_queue[shared->solution_count];
+
         solution->kind = kind;
         solution->number = number;
         for (face = 0; face < FACE_COUNT; ++face) {
             solution->encoding[face] =
-                (char)('A' + search->logical_die[search->owner[face]]);
+                (char)('A' + canonical_die[search->owner[face]]);
         }
         solution->encoding[FACE_COUNT] = '\0';
-        shared->solution_tail =
-            (shared->solution_tail + 1U) % SOLUTION_QUEUE_CAPACITY;
-        ++shared->solution_count;
-        enqueued = true;
     }
+    ++shared->solution_count;
+    flush_ready = shared->solution_count == SOLUTION_FLUSH_THRESHOLD;
     pthread_mutex_unlock(&shared->solution_mutex);
 
-    /* Wake the watcher so redirected all-solution output drains promptly. */
-    if (enqueued) {
+    /*
+     * Once a useful file-write batch is ready, synchronize with the watcher's
+     * condition wait so the notification cannot be lost between its queue
+     * check and pthread_cond_timedwait().  Partial batches are flushed by the
+     * one-second watcher tick and by shutdown.
+     */
+    if (flush_ready) {
+        pthread_mutex_lock(&shared->completion_mutex);
         pthread_cond_signal(&shared->completion_condition);
+        pthread_mutex_unlock(&shared->completion_mutex);
     }
 }
 
@@ -3228,22 +3263,31 @@ static void *worker_main(void *argument)
     return NULL;
 }
 
-static bool append_solution_file(const struct shared_state *shared,
-                                 const struct solution *solution)
+static bool append_solution_batch(const struct shared_state *shared,
+                                  const struct solution *solutions,
+                                  unsigned count)
 {
-    char record[FACE_COUNT + 128U];
+    char *records = shared->solution_write_buffer;
+    size_t length = 0;
     size_t written = 0;
     int descriptor = -1;
-    int length;
     int saved_errno;
+    unsigned i;
 
-    length = snprintf(record, sizeof(record),
-                      "%s config=%dd%d mirror=%d encoding=%s\n",
-                      solution_kind_name(solution->kind), DICE, SIDES,
-                      MIRROR, solution->encoding);
-    if (length < 0 || (size_t)length >= sizeof(record)) {
-        errno = EOVERFLOW;
-        return false;
+    for (i = 0; i < count; ++i) {
+        const struct solution *solution = &solutions[i];
+        size_t remaining = SOLUTION_RECORD_CAPACITY;
+        int result = snprintf(
+            records + length, remaining,
+            "%s config=%dd%d mirror=%d encoding=%s\n",
+            solution_kind_name(solution->kind), DICE, SIDES,
+            MIRROR, solution->encoding);
+
+        if (result < 0 || (size_t)result >= remaining) {
+            errno = EOVERFLOW;
+            return false;
+        }
+        length += (size_t)result;
     }
 
     descriptor = open(shared->options.solutions_path,
@@ -3256,9 +3300,9 @@ static bool append_solution_file(const struct shared_state *shared,
             goto fail;
         }
     }
-    while (written < (size_t)length) {
-        ssize_t result = write(descriptor, record + written,
-                               (size_t)length - written);
+    while (written < length) {
+        ssize_t result = write(descriptor, records + written,
+                               length - written);
 
         if (result > 0) {
             written += (size_t)result;
@@ -3269,7 +3313,7 @@ static bool append_solution_file(const struct shared_state *shared,
             goto fail;
         }
     }
-    /* Closing releases the lock; no descriptor is retained between results. */
+    /* Closing releases the lock; no descriptor is retained between batches. */
     if (close(descriptor) != 0) {
         return false;
     }
@@ -3284,41 +3328,45 @@ fail:
 
 static void drain_solutions(struct shared_state *shared)
 {
-    for (;;) {
-        struct solution solution;
-        bool have_solution;
+    struct solution *batch;
+    unsigned count;
+    unsigned i;
 
-        pthread_mutex_lock(&shared->solution_mutex);
-        have_solution = shared->solution_count != 0;
-        if (have_solution) {
-            solution = shared->solution_queue[shared->solution_head];
-            shared->solution_head =
-                (shared->solution_head + 1U) % SOLUTION_QUEUE_CAPACITY;
-            --shared->solution_count;
-            pthread_cond_signal(&shared->solution_not_full);
-        }
-        pthread_mutex_unlock(&shared->solution_mutex);
-        if (!have_solution) {
-            break;
-        }
-        if (shared->options.solutions_path != NULL &&
-            !shared->solution_file_failed &&
-            !append_solution_file(shared, &solution)) {
-            int append_errno = errno;
+    pthread_mutex_lock(&shared->solution_mutex);
+    count = shared->solution_count;
+    batch = shared->solution_queue;
+    if (count != 0) {
+        shared->solution_queue = shared->solution_batch;
+        shared->solution_batch = batch;
+        shared->solution_count = 0;
+        pthread_cond_broadcast(&shared->solution_not_full);
+    }
+    pthread_mutex_unlock(&shared->solution_mutex);
 
-            fprintf(stderr, "Unable to append solution to '%s': %s\n",
-                    shared->options.solutions_path,
-                    strerror(append_errno));
-            shared->solution_file_failed = true;
-            atomic_store_explicit(&shared->internal_error, true,
-                                  memory_order_relaxed);
-            atomic_store_explicit(&shared->stop, true,
-                                  memory_order_relaxed);
-        }
-        if (solution.number <= shared->options.print_limit) {
+    if (count == 0) {
+        return;
+    }
+    if (shared->options.solutions_path != NULL &&
+        !shared->solution_file_failed &&
+        !append_solution_batch(shared, batch, count)) {
+        int append_errno = errno;
+
+        fprintf(stderr, "Unable to append solutions to '%s': %s\n",
+                shared->options.solutions_path,
+                strerror(append_errno));
+        shared->solution_file_failed = true;
+        atomic_store_explicit(&shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&shared->stop, true,
+                              memory_order_relaxed);
+    }
+    for (i = 0; i < count; ++i) {
+        const struct solution *solution = &batch[i];
+
+        if (solution->number <= shared->options.print_limit) {
             printf("%s #%" PRIu64 " encoding=%s\n",
-                   solution_kind_name(solution.kind),
-                   solution.number, solution.encoding);
+                   solution_kind_name(solution->kind),
+                   solution->number, solution->encoding);
         }
     }
     fflush(stdout);
@@ -3401,6 +3449,16 @@ static void print_progress(const struct shared_state *shared,
     fflush(stderr);
 }
 
+static bool solution_batch_ready(struct shared_state *shared)
+{
+    bool ready;
+
+    pthread_mutex_lock(&shared->solution_mutex);
+    ready = shared->solution_count >= SOLUTION_FLUSH_THRESHOLD;
+    pthread_mutex_unlock(&shared->solution_mutex);
+    return ready;
+}
+
 static void watch_workers(struct shared_state *shared,
                           const struct worker *workers, double start_time)
 {
@@ -3413,7 +3471,8 @@ static void watch_workers(struct shared_state *shared,
 
         pthread_mutex_lock(&shared->completion_mutex);
         running = shared->workers_running;
-        if (running != 0) {
+        if (running != 0 && !sigint_requested &&
+            !solution_batch_ready(shared)) {
             struct timespec deadline;
             clock_gettime(CLOCK_REALTIME, &deadline);
             ++deadline.tv_sec;
@@ -3583,6 +3642,25 @@ int main(int argc, char **argv)
         shared.thread_count = (unsigned)shared.job_count;
     }
 
+    shared.solution_queue = malloc(
+        (size_t)SOLUTION_QUEUE_CAPACITY * sizeof(*shared.solution_queue));
+    shared.solution_batch = malloc(
+        (size_t)SOLUTION_QUEUE_CAPACITY * sizeof(*shared.solution_batch));
+    if (options.solutions_path != NULL) {
+        shared.solution_write_buffer = malloc(
+            (size_t)SOLUTION_QUEUE_CAPACITY * SOLUTION_RECORD_CAPACITY);
+    }
+    if (shared.solution_queue == NULL || shared.solution_batch == NULL ||
+        (options.solutions_path != NULL &&
+         shared.solution_write_buffer == NULL)) {
+        fprintf(stderr, "Unable to allocate solution output buffers.\n");
+        free(shared.solution_write_buffer);
+        free(shared.solution_batch);
+        free(shared.solution_queue);
+        free(prototype);
+        return EXIT_FAILURE;
+    }
+
     atomic_init(&shared.next_job, 0);
     atomic_init(&shared.jobs_done, 0);
     atomic_init(&shared.limit_claims, 0);
@@ -3595,6 +3673,10 @@ int main(int argc, char **argv)
         pthread_mutex_init(&shared.solution_mutex, NULL) != 0 ||
         pthread_cond_init(&shared.solution_not_full, NULL) != 0) {
         fprintf(stderr, "Unable to initialize pthread synchronization.\n");
+        free(shared.solution_write_buffer);
+        free(shared.solution_batch);
+        free(shared.solution_queue);
+        free(prototype);
         return EXIT_FAILURE;
     }
     if (!initialize_job_order(&shared)) {
@@ -3879,6 +3961,9 @@ cleanup:
     free(prototype);
     free(workers);
     free(shared.job_order);
+    free(shared.solution_write_buffer);
+    free(shared.solution_batch);
+    free(shared.solution_queue);
     pthread_cond_destroy(&shared.solution_not_full);
     pthread_mutex_destroy(&shared.solution_mutex);
     pthread_cond_destroy(&shared.completion_condition);

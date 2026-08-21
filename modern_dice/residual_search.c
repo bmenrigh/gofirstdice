@@ -20,6 +20,12 @@
  * locks and allocate no memory while exploring nonsolutions.  New pruning
  * belongs in try_owner(), so prefix construction, replay, and recursive
  * search all continue to use the same transition rules.
+ *
+ * --extend-solutions uses a separate recursive path.  It preserves each
+ * input (DICE-1)-die encoding as a canonical subsequence, pads those dice to
+ * SIDES, and inserts a new die in every possible canonical first-occurrence
+ * position.  Its cursor and planner do not add branches or state to the
+ * exhaustive recursion above.
  */
 
 #include <errno.h>
@@ -48,6 +54,10 @@
 #define MIRROR 0
 #endif
 
+#ifndef COLUMN_GROUP
+#define COLUMN_GROUP 0
+#endif
+
 #ifndef RESIDUAL_RIGHT_END_CHECK
 #define RESIDUAL_RIGHT_END_CHECK 1
 #endif
@@ -56,8 +66,20 @@
 #define RESIDUAL_TWO_END_SEARCH 1
 #endif
 
+#ifndef RESIDUAL_EXTENSION
+#define RESIDUAL_EXTENSION 1
+#endif
+
 #if MIRROR != 0 && MIRROR != 1
 #error "MIRROR must be either 0 or 1"
+#endif
+
+#if COLUMN_GROUP != 0 && COLUMN_GROUP != 1
+#error "COLUMN_GROUP must be either 0 or 1"
+#endif
+
+#if RESIDUAL_EXTENSION != 0 && RESIDUAL_EXTENSION != 1
+#error "RESIDUAL_EXTENSION must be either 0 or 1"
 #endif
 
 #if MIRROR && ((SIDES % 2) != 0)
@@ -65,8 +87,10 @@
 #endif
 
 #define FACE_COUNT (DICE * SIDES)
+#define BASE_DICE (DICE - 1U)
 #define DEFAULT_PRINT_LIMIT UINT64_C(10)
 #define DEFAULT_JOBS_PER_THREAD UINT64_C(8)
+#define DEFAULT_PROGRESS_SECONDS UINT64_C(1)
 #define PUBLISH_NODE_INTERVAL UINT64_C(1048576)
 #define STOP_POLL_INTERVAL UINT64_C(4096)
 #define PREFIX_RIGHT_FLAG UINT8_C(0x80)
@@ -76,6 +100,7 @@
 #define SEARCH_STEP_FACES 1U
 #endif
 #define SEARCH_DECISION_COUNT (FACE_COUNT / SEARCH_STEP_FACES)
+#define ALL_OWNER_MASK ((1U << DICE) - 1U)
 
 #if DICE == 2
 #define PERM_STATE_COUNT 5U
@@ -107,6 +132,8 @@ struct options {
     uint64_t print_limit;
     uint64_t jobs;
     uint64_t seed;
+    uint64_t progress_seconds;
+    const char *extend_solutions_path;
     unsigned threads;
     bool quiet;
     bool threads_given;
@@ -151,9 +178,39 @@ struct search {
 
 struct prefix_list {
     uint8_t *owners;
+    uint64_t *base_indices;
+    uint8_t *new_owners;
     uint64_t count;
     uint64_t capacity;
     unsigned depth;
+};
+
+struct extension_base {
+    uint8_t *owners;
+    uint16_t sides;
+    uint16_t length;
+};
+
+struct extension_base_list {
+    struct extension_base *items;
+    uint64_t count;
+    uint64_t capacity;
+    uint64_t duplicate_count;
+    uint64_t lesser_count;
+    uint64_t same_side_nonfair_count;
+    unsigned minimum_sides;
+    unsigned maximum_sides;
+};
+
+struct extension_cursor {
+    const struct extension_base *base;
+    uint16_t padding_remaining[DICE];
+    uint8_t base_owner_map[BASE_DICE];
+    unsigned base_left;
+    unsigned base_right;
+    unsigned left_depth;
+    unsigned right_depth;
+    unsigned used_labels;
 };
 
 struct published_stats {
@@ -169,9 +226,16 @@ struct solution {
     char encoding[FACE_COUNT + 1U];
 };
 
+struct solution_set {
+    char **slots;
+    size_t count;
+    size_t capacity;
+};
+
 struct shared_state {
     struct options options;
     struct prefix_list prefixes;
+    struct extension_base_list extension_bases;
     uint64_t *job_order;
     uint64_t job_count;
     uint64_t setup_nodes;
@@ -181,6 +245,7 @@ struct shared_state {
     atomic_uint_fast64_t next_job;
     atomic_uint_fast64_t jobs_done;
     atomic_uint_fast64_t configurations;
+    atomic_uint_fast64_t duplicate_configurations;
     atomic_uint active_workers;
     atomic_bool stop;
     atomic_bool internal_error;
@@ -190,6 +255,7 @@ struct shared_state {
     pthread_cond_t event_condition;
     struct solution *solution_head;
     struct solution *solution_tail;
+    struct solution_set extension_solutions;
 };
 
 struct worker {
@@ -205,6 +271,7 @@ struct totals {
     uint64_t right_end_prunes;
     uint64_t left_end_prunes;
     uint64_t configurations;
+    uint64_t duplicate_configurations;
 };
 
 enum owner_result {
@@ -230,7 +297,7 @@ static void usage(FILE *stream, const char *program)
 {
     fprintf(stream,
             "Usage: %s [OPTIONS]\n\n"
-            "Exhaustively search canonical %s%dd%d owner strings using "
+            "Exhaustively search canonical %s%s%dd%d owner strings using "
             "exact "
             "residual roll counts.\n\n"
             "  -t, --threads N     worker threads; default is online CPUs\n"
@@ -241,9 +308,16 @@ static void usage(FILE *stream, const char *program)
             "      --all-solutions print every configuration\n"
             "      --random-order  shuffle logical jobs before searching\n"
             "      --seed N        random-order seed; requires --random-order\n"
+            "      --extend-solutions FILE\n"
+            "                      extend canonical (DICE-1)-die encodings\n"
+            "                      from FILE by padding to SIDES and adding\n"
+            "                      one new die in every first-occurrence\n"
+            "                      position\n"
+            "  -p, --progress N    progress interval in seconds; 0 disables\n"
             "  -q, --quiet         suppress configuration output\n"
             "  -h, --help          show this help\n",
-            program, MIRROR ? "mirrored " : "", DICE, SIDES);
+            program, MIRROR ? "mirrored " : "",
+            COLUMN_GROUP ? "column-grouped " : "", DICE, SIDES);
 }
 
 static bool parse_uint64(const char *text, uint64_t *value)
@@ -269,6 +343,7 @@ static bool parse_options(int argc, char **argv, struct options *options)
 
     *options = (struct options){
         .print_limit = DEFAULT_PRINT_LIMIT,
+        .progress_seconds = DEFAULT_PROGRESS_SECONDS,
     };
     for (argument = 1; argument < argc; ++argument) {
         const char *option = argv[argument];
@@ -301,6 +376,13 @@ static bool parse_options(int argc, char **argv, struct options *options)
                 !parse_uint64(argv[argument], &options->limit)) {
                 return false;
             }
+        } else if (strcmp(option, "-p") == 0 ||
+                   strcmp(option, "--progress") == 0) {
+            if (++argument == argc ||
+                !parse_uint64(argv[argument], &options->progress_seconds)) {
+                fputs("Invalid progress interval.\n", stderr);
+                return false;
+            }
         } else if (strcmp(option, "--random-order") == 0) {
             options->random_order = true;
         } else if (strcmp(option, "--seed") == 0) {
@@ -309,6 +391,14 @@ static bool parse_options(int argc, char **argv, struct options *options)
                 return false;
             }
             options->seed_given = true;
+        } else if (strcmp(option, "--extend-solutions") == 0) {
+            if (++argument == argc || *argv[argument] == '\0' ||
+                options->extend_solutions_path != NULL) {
+                fputs("--extend-solutions requires one non-empty file path.\n",
+                      stderr);
+                return false;
+            }
+            options->extend_solutions_path = argv[argument];
         } else if (strcmp(option, "--print-limit") == 0) {
             if (++argument == argc ||
                 !parse_uint64(argv[argument], &options->print_limit)) {
@@ -554,6 +644,267 @@ static bool initialize_targets(struct search *search)
     return true;
 }
 
+static void free_extension_bases(struct extension_base_list *bases)
+{
+    uint64_t index;
+
+    for (index = 0; index < bases->count; ++index) {
+        free(bases->items[index].owners);
+    }
+    free(bases->items);
+    *bases = (struct extension_base_list){0};
+}
+
+#if RESIDUAL_EXTENSION
+static bool canonicalize_extension_base(const char *text, size_t length,
+                                        struct extension_base *base)
+{
+    uint8_t owner_map[UCHAR_MAX + 1U];
+    uint16_t owner_count[DICE] = {0};
+    uint8_t *owners;
+    unsigned next_owner = 0;
+    unsigned sides;
+    size_t face;
+
+    if (length == 0 || length > BASE_DICE * (size_t)SIDES ||
+        length % BASE_DICE != 0) {
+        return false;
+    }
+    sides = (unsigned)(length / BASE_DICE);
+    if (sides == 0 || sides > SIDES) {
+        return false;
+    }
+    memset(owner_map, UINT8_MAX, sizeof(owner_map));
+    owners = malloc(length);
+    if (owners == NULL) {
+        return false;
+    }
+    for (face = 0; face < length; ++face) {
+        unsigned char symbol = (unsigned char)text[face];
+        unsigned owner;
+
+        if (!((symbol >= (unsigned char)'a' &&
+               symbol <= (unsigned char)'z') ||
+              (symbol >= (unsigned char)'A' &&
+               symbol <= (unsigned char)'Z'))) {
+            free(owners);
+            return false;
+        }
+        if (owner_map[symbol] == UINT8_MAX) {
+            if (next_owner >= BASE_DICE) {
+                free(owners);
+                return false;
+            }
+            owner_map[symbol] = (uint8_t)next_owner++;
+        }
+        owner = owner_map[symbol];
+        owners[face] = (uint8_t)owner;
+        ++owner_count[owner];
+    }
+    if (next_owner != BASE_DICE) {
+        free(owners);
+        return false;
+    }
+    for (unsigned owner = 0; owner < BASE_DICE; ++owner) {
+        if (owner_count[owner] != sides) {
+            free(owners);
+            return false;
+        }
+    }
+    base->owners = owners;
+    base->sides = (uint16_t)sides;
+    base->length = (uint16_t)length;
+    return true;
+}
+
+static bool extension_base_is_permutation_fair(
+    const struct search *search, const struct extension_base *base)
+{
+    uint64_t ways[PERM_STATE_COUNT] = {0};
+    uint64_t base_target[DICE] = {0};
+    uint64_t factorial = 1;
+    unsigned length;
+    unsigned face;
+    size_t state;
+
+    base_target[0] = 1;
+    for (length = 1; length <= BASE_DICE; ++length) {
+        uint64_t outcomes;
+
+        factorial *= length;
+        if (!integer_power(base->sides, length, &outcomes) ||
+            outcomes % factorial != 0) {
+            return false;
+        }
+        base_target[length] = outcomes / factorial;
+    }
+    ways[0] = 1;
+    for (face = 0; face < base->length; ++face) {
+        unsigned owner = (unsigned)base->owners[face] + 1U;
+        unsigned edge;
+
+        for (edge = 0; edge < OWNER_EDGE_COUNT; ++edge) {
+            const struct edge *transition = &search->append[owner][edge];
+
+            ways[transition->destination] += ways[transition->source];
+        }
+    }
+    for (state = 0; state < PERM_STATE_COUNT; ++state) {
+        if ((search->state[state].mask & 1U) == 0 &&
+            ways[state] != base_target[search->state[state].length]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool append_extension_base(struct extension_base_list *bases,
+                                  struct extension_base base)
+{
+    if (bases->count == bases->capacity) {
+        uint64_t capacity = bases->capacity == 0 ? UINT64_C(64) :
+            bases->capacity * 2U;
+        struct extension_base *items;
+
+        if (capacity < bases->capacity ||
+            capacity > SIZE_MAX / sizeof(*bases->items)) {
+            return false;
+        }
+        items = realloc(bases->items,
+                        (size_t)capacity * sizeof(*bases->items));
+        if (items == NULL) {
+            return false;
+        }
+        bases->items = items;
+        bases->capacity = capacity;
+    }
+    bases->items[bases->count++] = base;
+    return true;
+}
+
+static int compare_extension_bases(const void *left_pointer,
+                                   const void *right_pointer)
+{
+    const struct extension_base *left = left_pointer;
+    const struct extension_base *right = right_pointer;
+    int comparison;
+
+    if (left->sides != right->sides) {
+        return left->sides < right->sides ? -1 : 1;
+    }
+    comparison = memcmp(left->owners, right->owners, left->length);
+    return comparison < 0 ? -1 : comparison > 0 ? 1 : 0;
+}
+
+static void deduplicate_extension_bases(struct extension_base_list *bases)
+{
+    uint64_t read;
+    uint64_t write = 0;
+
+    qsort(bases->items, (size_t)bases->count, sizeof(*bases->items),
+          compare_extension_bases);
+    for (read = 0; read < bases->count; ++read) {
+        if (write != 0 &&
+            compare_extension_bases(&bases->items[write - 1U],
+                                    &bases->items[read]) == 0) {
+            free(bases->items[read].owners);
+            ++bases->duplicate_count;
+            continue;
+        }
+        if (write != read) {
+            bases->items[write] = bases->items[read];
+        }
+        ++write;
+    }
+    bases->count = write;
+    if (write != 0) {
+        bases->minimum_sides = bases->items[0].sides;
+        bases->maximum_sides = bases->items[write - 1U].sides;
+    }
+}
+
+static bool load_extension_bases(const char *path, const struct search *search,
+                                 struct extension_base_list *bases)
+{
+    FILE *file = fopen(path, "r");
+    char *line = NULL;
+    size_t capacity = 0;
+    uint64_t line_number = 0;
+    bool valid = true;
+
+    if (file == NULL) {
+        fprintf(stderr, "Unable to open extension solutions file %s: %s\n",
+                path, strerror(errno));
+        return false;
+    }
+    while (getline(&line, &capacity, file) >= 0) {
+        const char *marker;
+        const char *encoding;
+        size_t length;
+        struct extension_base base = {0};
+
+        if (interrupt_requested) {
+            valid = false;
+            break;
+        }
+        ++line_number;
+        marker = strstr(line, "encoding=");
+        if (marker == NULL) {
+            continue;
+        }
+        encoding = marker + strlen("encoding=");
+        length = strcspn(encoding, " \t\r\n");
+        if (!canonicalize_extension_base(encoding, length, &base)) {
+            fprintf(stderr,
+                    "%s:%" PRIu64 ": encoding is not a balanced "
+                    "%u-die configuration with at most %d sides.\n",
+                    path, line_number, BASE_DICE, SIDES);
+            valid = false;
+            break;
+        }
+        if (!extension_base_is_permutation_fair(search, &base)) {
+            if (base.sides == SIDES) {
+                free(base.owners);
+                ++bases->same_side_nonfair_count;
+                continue;
+            }
+            ++bases->lesser_count;
+        }
+        if (!append_extension_base(bases, base)) {
+            free(base.owners);
+            fputs("Unable to allocate extension-base table.\n", stderr);
+            valid = false;
+            break;
+        }
+    }
+    if (ferror(file)) {
+        fprintf(stderr, "Unable to read extension solutions file %s: %s\n",
+                path, strerror(errno));
+        valid = false;
+    }
+    free(line);
+    if (fclose(file) != 0 && valid) {
+        fprintf(stderr, "Unable to close extension solutions file %s: %s\n",
+                path, strerror(errno));
+        valid = false;
+    }
+    if (!valid) {
+        free_extension_bases(bases);
+        return false;
+    }
+    if (bases->count == 0) {
+        fprintf(stderr,
+                "Extension solutions file %s contains no usable "
+                "balanced %u-die encodings.\n",
+                path, BASE_DICE);
+        free_extension_bases(bases);
+        return false;
+    }
+    deduplicate_extension_bases(bases);
+    return true;
+}
+#endif
+
 static void subtract_prefix_owner(struct search *search, unsigned owner)
 {
     unsigned edge;
@@ -688,6 +1039,51 @@ static unsigned owner_mask_count(unsigned mask)
     return count;
 }
 
+static bool column_fronts_share_group(unsigned left_depth,
+                                      unsigned right_depth)
+{
+#if COLUMN_GROUP
+    return left_depth + right_depth < FACE_COUNT &&
+        left_depth / DICE ==
+            (FACE_COUNT - 1U - right_depth) / DICE;
+#else
+    (void)left_depth;
+    (void)right_depth;
+    return false;
+#endif
+}
+
+static unsigned column_allowed_owner_mask(unsigned used_owner_mask,
+                                          unsigned opposite_owner_mask,
+                                          bool shared_group)
+{
+#if COLUMN_GROUP
+    unsigned blocked = used_owner_mask |
+        (shared_group ? opposite_owner_mask : 0U);
+
+    return ALL_OWNER_MASK & ~blocked;
+#else
+    (void)used_owner_mask;
+    (void)opposite_owner_mask;
+    (void)shared_group;
+    return ALL_OWNER_MASK;
+#endif
+}
+
+static unsigned column_mask_after_owner(unsigned used_owner_mask,
+                                        unsigned owner)
+{
+#if COLUMN_GROUP
+    unsigned next = used_owner_mask | (1U << owner);
+
+    return next == ALL_OWNER_MASK ? 0U : next;
+#else
+    (void)used_owner_mask;
+    (void)owner;
+    return 0U;
+#endif
+}
+
 /*
  * Every nonempty realizable residual word has some final owner.  If that
  * owner is x, removing its final occurrence performs the right-handed
@@ -714,43 +1110,64 @@ static bool has_feasible_first_owner(const struct search *search)
 }
 
 static struct end_plan plan_search_end(const struct search *search,
-                                       unsigned used_labels)
+                                       unsigned used_labels,
+                                       unsigned left_depth,
+                                       unsigned right_depth,
+                                       unsigned left_column_mask,
+                                       unsigned right_column_mask)
 {
     unsigned owner_limit = used_labels < DICE ? used_labels + 1U : DICE;
     unsigned available = available_owner_mask(search, owner_limit);
+    bool shared_group = column_fronts_share_group(left_depth, right_depth);
+    unsigned left_available = available &
+        column_allowed_owner_mask(left_column_mask, right_column_mask,
+                                  shared_group);
     unsigned left_mask = feasible_owner_mask(search, search->prepend,
-                                             owner_limit);
+                                             owner_limit) & left_available;
     struct end_plan plan = {
         .end = SEARCH_LEFT,
         .owner_mask = left_mask,
     };
 
     if (used_labels < DICE) {
-        plan.rejected_owners = owner_mask_count(available) -
+        plan.rejected_owners = owner_mask_count(left_available) -
             owner_mask_count(left_mask);
         return plan;
     }
     {
+        unsigned right_available = available &
+            column_allowed_owner_mask(right_column_mask, left_column_mask,
+                                      shared_group);
         unsigned right_mask = feasible_owner_mask(search, search->append,
-                                                  DICE);
+                                                  DICE) & right_available;
 
         if (owner_mask_count(right_mask) < owner_mask_count(left_mask)) {
             plan.end = SEARCH_RIGHT;
             plan.owner_mask = right_mask;
+            plan.rejected_owners = owner_mask_count(right_available) -
+                owner_mask_count(right_mask);
+            return plan;
         }
     }
-    plan.rejected_owners = owner_mask_count(available) -
-        owner_mask_count(plan.owner_mask);
+    plan.rejected_owners = owner_mask_count(left_available) -
+        owner_mask_count(left_mask);
     return plan;
 }
 #else
 static struct end_plan plan_search_end(const struct search *search,
-                                       unsigned used_labels)
+                                       unsigned used_labels,
+                                       unsigned left_depth,
+                                       unsigned right_depth,
+                                       unsigned left_column_mask,
+                                       unsigned right_column_mask)
 {
     unsigned owner_limit = used_labels < DICE ? used_labels + 1U : DICE;
-    unsigned available = available_owner_mask(search, owner_limit);
+    bool shared_group = column_fronts_share_group(left_depth, right_depth);
+    unsigned available = available_owner_mask(search, owner_limit) &
+        column_allowed_owner_mask(left_column_mask, right_column_mask,
+                                  shared_group);
     unsigned feasible = feasible_owner_mask(search, search->prepend,
-                                            owner_limit);
+                                            owner_limit) & available;
 
     return (struct end_plan){
         .end = SEARCH_LEFT,
@@ -762,12 +1179,220 @@ static struct end_plan plan_search_end(const struct search *search,
 #endif
 #endif
 
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+static unsigned extension_mapped_base_owner(
+    const struct extension_cursor *cursor, unsigned base_owner)
+{
+    return cursor->base_owner_map[base_owner];
+}
+
+static unsigned extension_fixed_owner(const struct extension_cursor *cursor,
+                                      enum search_end end)
+{
+    unsigned base_position;
+
+    if (cursor->base_left == cursor->base_right) {
+        return DICE;
+    }
+    base_position = end == SEARCH_LEFT ? cursor->base_left :
+        cursor->base_right - 1U;
+    return extension_mapped_base_owner(
+        cursor, cursor->base->owners[base_position]);
+}
+
+static unsigned extension_legal_owner_mask(
+    const struct extension_cursor *cursor, enum search_end end)
+{
+    unsigned owner_limit = end == SEARCH_LEFT && cursor->used_labels < DICE
+        ? cursor->used_labels + 1U : DICE;
+    unsigned fixed_owner = extension_fixed_owner(cursor, end);
+    unsigned mask = 0;
+    unsigned owner;
+
+    for (owner = 0; owner < owner_limit; ++owner) {
+        if (cursor->padding_remaining[owner] != 0) {
+            mask |= 1U << owner;
+        }
+    }
+    if (fixed_owner < owner_limit) {
+        /* Matching an exposed skeleton face always consumes it.  Excluding
+         * the indistinguishable padding move gives every interleaving one
+         * canonical embedding of the fixed skeleton. */
+        mask |= 1U << fixed_owner;
+    }
+    return mask;
+}
+
+static unsigned feasible_extension_owner_mask(
+    const struct search *search,
+    const struct edge (*edges)[OWNER_EDGE_COUNT], unsigned candidates)
+{
+    unsigned feasible = 0;
+
+    while (candidates != 0) {
+        unsigned owner = (unsigned)__builtin_ctz(candidates);
+        unsigned edge;
+
+        candidates &= candidates - 1U;
+        if (search->remaining[owner] == 0) {
+            continue;
+        }
+        for (edge = 0; edge < OWNER_EDGE_COUNT; ++edge) {
+            const struct edge *transition = &edges[owner][edge];
+
+            if (search->residual[transition->destination] <
+                search->residual[transition->source]) {
+                break;
+            }
+        }
+        if (edge == OWNER_EDGE_COUNT) {
+            feasible |= 1U << owner;
+        }
+    }
+    return feasible;
+}
+
+static struct end_plan plan_extension_end(
+    const struct search *search, const struct extension_cursor *cursor)
+{
+    unsigned left_legal = extension_legal_owner_mask(cursor, SEARCH_LEFT);
+    unsigned left_feasible = feasible_extension_owner_mask(
+        search, search->prepend, left_legal);
+    struct end_plan plan = {
+        .end = SEARCH_LEFT,
+        .owner_mask = left_feasible,
+        .rejected_owners = owner_mask_count(left_legal) -
+            owner_mask_count(left_feasible),
+    };
+
+    /* First occurrences, including the selected position of the new die,
+     * are established from the left.  Once every label exists, either end
+     * can be peeled without introducing label-symmetry duplicates. */
+    if (cursor->used_labels < DICE) {
+        return plan;
+    }
+    {
+        unsigned right_legal = extension_legal_owner_mask(
+            cursor, SEARCH_RIGHT);
+        unsigned right_feasible = feasible_extension_owner_mask(
+            search, search->append, right_legal);
+
+        if (owner_mask_count(right_feasible) <
+            owner_mask_count(left_feasible)) {
+            plan.end = SEARCH_RIGHT;
+            plan.owner_mask = right_feasible;
+            plan.rejected_owners = owner_mask_count(right_legal) -
+                owner_mask_count(right_feasible);
+        }
+    }
+    return plan;
+}
+
+static bool apply_extension_owner(struct search *search,
+                                  struct extension_cursor *cursor,
+                                  enum search_end end, unsigned owner,
+                                  bool *fixed, bool *introduced)
+{
+    unsigned fixed_owner = extension_fixed_owner(cursor, end);
+    unsigned position = end == SEARCH_LEFT ? cursor->left_depth :
+        FACE_COUNT - 1U - cursor->right_depth;
+
+    *fixed = owner == fixed_owner;
+    *introduced = end == SEARCH_LEFT && owner == cursor->used_labels;
+    if (*fixed) {
+        if (end == SEARCH_LEFT) {
+            ++cursor->base_left;
+        } else {
+            --cursor->base_right;
+        }
+    } else {
+        if (cursor->padding_remaining[owner] == 0) {
+            return false;
+        }
+        --cursor->padding_remaining[owner];
+    }
+    --search->remaining[owner];
+    search->encoding[position] = (char)('a' + owner);
+    if (end == SEARCH_LEFT) {
+        subtract_prefix_owner(search, owner);
+        ++cursor->left_depth;
+        if (*introduced) {
+            ++cursor->used_labels;
+        }
+    } else {
+        subtract_suffix_owner(search, owner);
+        ++cursor->right_depth;
+    }
+    return true;
+}
+
+static void undo_extension_owner(struct search *search,
+                                 struct extension_cursor *cursor,
+                                 enum search_end end, unsigned owner,
+                                 bool fixed, bool introduced)
+{
+    if (end == SEARCH_LEFT) {
+        restore_prefix_owner(search, owner);
+        --cursor->left_depth;
+        if (introduced) {
+            --cursor->used_labels;
+        }
+    } else {
+        restore_suffix_owner(search, owner);
+        --cursor->right_depth;
+    }
+    ++search->remaining[owner];
+    if (fixed) {
+        if (end == SEARCH_LEFT) {
+            --cursor->base_left;
+        } else {
+            ++cursor->base_right;
+        }
+    } else {
+        ++cursor->padding_remaining[owner];
+    }
+}
+
+static void initialize_extension_cursor(const struct extension_base *base,
+                                        unsigned new_owner,
+                                        struct extension_cursor *cursor)
+{
+    unsigned base_owner;
+    unsigned owner;
+
+    *cursor = (struct extension_cursor){
+        .base = base,
+        .base_right = base->length,
+    };
+    /* Embed the canonical base labels around the selected missing label.
+     * The ordinary used-label rule then forces the new die's first face into
+     * that exact first-occurrence position. */
+    for (base_owner = 0; base_owner < BASE_DICE; ++base_owner) {
+        cursor->base_owner_map[base_owner] = (uint8_t)(
+            base_owner + (base_owner >= new_owner ? 1U : 0U));
+    }
+    for (owner = 0; owner < DICE; ++owner) {
+        cursor->padding_remaining[owner] = owner == new_owner
+            ? SIDES : (uint16_t)(SIDES - base->sides);
+    }
+}
+#endif
+
 #if MIRROR
 /* A mirrored decision removes the same owner from both residual ends. */
 static struct end_plan plan_mirror_pairs(struct search *search,
-                                         unsigned used_labels)
+                                         unsigned used_labels,
+                                         unsigned left_depth,
+                                         unsigned right_depth,
+                                         unsigned left_column_mask,
+                                         unsigned right_column_mask)
 {
     unsigned owner_limit = used_labels < DICE ? used_labels + 1U : DICE;
+    bool shared_group = column_fronts_share_group(left_depth, right_depth);
+    unsigned allowed = column_allowed_owner_mask(
+        left_column_mask, right_column_mask, shared_group) &
+        column_allowed_owner_mask(
+            right_column_mask, left_column_mask, shared_group);
     unsigned available = 0;
     unsigned feasible = 0;
     unsigned owner;
@@ -781,7 +1406,8 @@ static struct end_plan plan_mirror_pairs(struct search *search,
     for (owner = 0; owner < owner_limit; ++owner) {
         unsigned edge;
 
-        if (search->remaining[owner] < 2U) {
+        if (search->remaining[owner] < 2U ||
+            (allowed & (1U << owner)) == 0) {
             continue;
         }
         available |= 1U << owner;
@@ -796,17 +1422,11 @@ static struct end_plan plan_mirror_pairs(struct search *search,
         if (edge != OWNER_EDGE_COUNT) {
             continue;
         }
-        for (edge = 0; edge < OWNER_EDGE_COUNT; ++edge) {
-            const struct edge *transition = &search->append[owner][edge];
-
-            if (search->residual[transition->destination] <
-                search->residual[transition->source]) {
-                break;
-            }
-        }
-        if (edge == OWNER_EDGE_COUNT) {
-            feasible |= 1U << owner;
-        }
+        /* At every mirror-pair boundary residual[q] equals
+         * residual[reverse(q)].  Prepend and append feasibility are
+         * therefore equivalent, so a second append-edge scan would only
+         * repeat the work above. */
+        feasible |= 1U << owner;
     }
     return (struct end_plan){
         .end = SEARCH_LEFT,
@@ -844,6 +1464,25 @@ static bool verify_configuration(const struct search *search)
     unsigned face;
     size_t state;
 
+#if COLUMN_GROUP
+    for (face = 0; face < FACE_COUNT; face += DICE) {
+        unsigned owner_mask = 0;
+        unsigned offset;
+
+        for (offset = 0; offset < DICE; ++offset) {
+            unsigned owner =
+                (unsigned)(search->encoding[face + offset] - 'a');
+
+            if (owner >= DICE || (owner_mask & (1U << owner)) != 0) {
+                return false;
+            }
+            owner_mask |= 1U << owner;
+        }
+        if (owner_mask != ALL_OWNER_MASK) {
+            return false;
+        }
+    }
+#endif
     ways[0] = 1;
     for (face = 0; face < FACE_COUNT; ++face) {
         unsigned owner = (unsigned)(search->encoding[face] - 'a');
@@ -958,6 +1597,108 @@ static bool reserve_solution_number(struct shared_state *shared,
     }
 }
 
+#if RESIDUAL_EXTENSION
+static uint64_t hash_encoding(const char *encoding)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    unsigned face;
+
+    for (face = 0; face < FACE_COUNT; ++face) {
+        hash ^= (unsigned char)encoding[face];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool grow_solution_set(struct solution_set *set)
+{
+    size_t capacity = set->capacity == 0 ? 128U : set->capacity * 2U;
+    char **slots;
+    size_t old_slot;
+
+    if (capacity < set->capacity || capacity > SIZE_MAX / sizeof(*slots)) {
+        return false;
+    }
+    slots = calloc(capacity, sizeof(*slots));
+    if (slots == NULL) {
+        return false;
+    }
+    for (old_slot = 0; old_slot < set->capacity; ++old_slot) {
+        char *encoding = set->slots[old_slot];
+
+        if (encoding != NULL) {
+            size_t slot = (size_t)hash_encoding(encoding) & (capacity - 1U);
+
+            while (slots[slot] != NULL) {
+                slot = (slot + 1U) & (capacity - 1U);
+            }
+            slots[slot] = encoding;
+        }
+    }
+    free(set->slots);
+    set->slots = slots;
+    set->capacity = capacity;
+    return true;
+}
+
+/* Return 1 for a new encoding, 0 for a duplicate, and -1 on allocation
+ * failure.  This is called only for fully verified extension solutions. */
+static int remember_extension_solution(struct shared_state *shared,
+                                       const char *encoding)
+{
+    struct solution_set *set = &shared->extension_solutions;
+    size_t slot;
+    char *copy;
+    int result;
+
+    pthread_mutex_lock(&shared->solution_mutex);
+    if (set->capacity == 0 ||
+        set->count + 1U > set->capacity - set->capacity / 4U) {
+        if (!grow_solution_set(set)) {
+            pthread_mutex_unlock(&shared->solution_mutex);
+            return -1;
+        }
+    }
+    slot = (size_t)hash_encoding(encoding) & (set->capacity - 1U);
+    while (set->slots[slot] != NULL) {
+        if (memcmp(set->slots[slot], encoding, FACE_COUNT) == 0) {
+            pthread_mutex_unlock(&shared->solution_mutex);
+            atomic_fetch_add_explicit(&shared->duplicate_configurations, 1,
+                                      memory_order_relaxed);
+            return 0;
+        }
+        slot = (slot + 1U) & (set->capacity - 1U);
+    }
+    copy = malloc(FACE_COUNT + 1U);
+    if (copy == NULL) {
+        result = -1;
+    } else {
+        memcpy(copy, encoding, FACE_COUNT + 1U);
+        set->slots[slot] = copy;
+        ++set->count;
+        result = 1;
+    }
+    pthread_mutex_unlock(&shared->solution_mutex);
+    return result;
+}
+
+static void free_solution_set(struct solution_set *set)
+{
+    size_t slot;
+
+    for (slot = 0; slot < set->capacity; ++slot) {
+        free(set->slots[slot]);
+    }
+    free(set->slots);
+    *set = (struct solution_set){0};
+}
+#else
+static void free_solution_set(struct solution_set *set)
+{
+    (void)set;
+}
+#endif
+
 static bool record_configuration(struct search *search)
 {
     struct shared_state *shared = search->shared;
@@ -971,6 +1712,22 @@ static bool record_configuration(struct search *search)
         atomic_store_explicit(&shared->stop, true, memory_order_relaxed);
         return false;
     }
+#if RESIDUAL_EXTENSION
+    if (shared->options.extend_solutions_path != NULL) {
+        int unique = remember_extension_solution(shared, search->encoding);
+
+        if (unique == 0) {
+            return true;
+        }
+        if (unique < 0) {
+            search->internal_error = true;
+            atomic_store_explicit(&shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&shared->stop, true, memory_order_relaxed);
+            return false;
+        }
+    }
+#endif
     if (!reserve_solution_number(shared, &number)) {
         return false;
     }
@@ -1008,7 +1765,9 @@ static bool record_configuration(struct search *search)
 
 static void search_configurations(struct search *search, unsigned left_depth,
                                   unsigned right_depth,
-                                  unsigned used_labels)
+                                  unsigned used_labels,
+                                  unsigned left_column_mask,
+                                  unsigned right_column_mask)
 {
     unsigned assigned = left_depth + right_depth;
     struct end_plan plan;
@@ -1044,9 +1803,11 @@ static void search_configurations(struct search *search, unsigned left_depth,
     }
 
 #if MIRROR
-    plan = plan_mirror_pairs(search, used_labels);
+    plan = plan_mirror_pairs(search, used_labels, left_depth, right_depth,
+                             left_column_mask, right_column_mask);
 #else
-    plan = plan_search_end(search, used_labels);
+    plan = plan_search_end(search, used_labels, left_depth, right_depth,
+                           left_column_mask, right_column_mask);
 #endif
     end = plan.end;
     search->negative_prunes += plan.rejected_owners;
@@ -1080,7 +1841,13 @@ static void search_configurations(struct search *search, unsigned left_depth,
                 search,
                 left_depth + (MIRROR || end == SEARCH_LEFT ? 1U : 0U),
                 right_depth + (MIRROR || end == SEARCH_RIGHT ? 1U : 0U),
-                used_labels + (new_label ? 1U : 0U));
+                used_labels + (new_label ? 1U : 0U),
+                MIRROR || end == SEARCH_LEFT ?
+                    column_mask_after_owner(left_column_mask, owner) :
+                    left_column_mask,
+                MIRROR || end == SEARCH_RIGHT ?
+                    column_mask_after_owner(right_column_mask, owner) :
+                    right_column_mask);
 #if MIRROR
             undo_mirror_pair(search, owner);
 #else
@@ -1093,6 +1860,91 @@ static void search_configurations(struct search *search, unsigned left_depth,
         }
     }
 }
+
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+static bool extension_cursor_is_complete(
+    const struct extension_cursor *cursor)
+{
+    unsigned owner;
+
+    if (cursor->base_left != cursor->base_right) {
+        return false;
+    }
+    for (owner = 0; owner < DICE; ++owner) {
+        if (cursor->padding_remaining[owner] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void search_extensions(struct search *search,
+                              struct extension_cursor *cursor)
+{
+    unsigned assigned = cursor->left_depth + cursor->right_depth;
+    struct end_plan plan;
+    unsigned owner;
+
+    if (search->internal_error) {
+        return;
+    }
+    if ((search->nodes & (STOP_POLL_INTERVAL - 1U)) == 0 &&
+        atomic_load_explicit(&search->shared->stop, memory_order_relaxed)) {
+        return;
+    }
+    if (search->shared->options.node_limit != 0 &&
+        search->node_base + search->nodes >=
+            search->shared->options.node_limit) {
+        atomic_store_explicit(&search->shared->node_limit_reached, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        return;
+    }
+    ++search->nodes;
+    if ((search->nodes & (PUBLISH_NODE_INTERVAL - 1U)) == 0) {
+        publish_stats(search);
+    }
+    if (assigned == FACE_COUNT) {
+        if (!extension_cursor_is_complete(cursor)) {
+            search->internal_error = true;
+            atomic_store_explicit(&search->shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&search->shared->stop, true,
+                                  memory_order_relaxed);
+            return;
+        }
+        (void)record_configuration(search);
+        return;
+    }
+
+    plan = plan_extension_end(search, cursor);
+    search->negative_prunes += plan.rejected_owners;
+    for (owner = 0; owner < DICE; ++owner) {
+        bool fixed;
+        bool introduced;
+
+        if ((plan.owner_mask & (1U << owner)) == 0) {
+            continue;
+        }
+        if (!apply_extension_owner(search, cursor, plan.end, owner,
+                                   &fixed, &introduced)) {
+            search->internal_error = true;
+            atomic_store_explicit(&search->shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&search->shared->stop, true,
+                                  memory_order_relaxed);
+            return;
+        }
+        search_extensions(search, cursor);
+        undo_extension_owner(search, cursor, plan.end, owner, fixed,
+                             introduced);
+        if (search->internal_error) {
+            return;
+        }
+    }
+}
+#endif
 
 static bool append_prefix(struct prefix_list *prefixes, const uint8_t *steps)
 {
@@ -1119,10 +1971,89 @@ static bool append_prefix(struct prefix_list *prefixes, const uint8_t *steps)
     return true;
 }
 
+static void clear_prefixes(struct prefix_list *prefixes)
+{
+    free(prefixes->owners);
+    free(prefixes->base_indices);
+    free(prefixes->new_owners);
+    *prefixes = (struct prefix_list){0};
+}
+
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+static bool append_extension_prefix(struct prefix_list *prefixes,
+                                    const uint8_t *steps,
+                                    uint64_t base_index,
+                                    unsigned new_owner)
+{
+    if (new_owner >= DICE) {
+        return false;
+    }
+    if (prefixes->count == prefixes->capacity) {
+        uint64_t capacity = prefixes->capacity == 0
+            ? UINT64_C(64) : prefixes->capacity * 2U;
+        uint8_t *owners = NULL;
+        uint8_t *new_owners;
+        uint64_t *base_indices;
+
+        if (capacity < prefixes->capacity ||
+            capacity > SIZE_MAX / sizeof(*base_indices) ||
+            (prefixes->depth != 0 &&
+             capacity > SIZE_MAX / prefixes->depth)) {
+            return false;
+        }
+        base_indices = malloc((size_t)capacity * sizeof(*base_indices));
+        if (base_indices == NULL) {
+            return false;
+        }
+        new_owners = malloc((size_t)capacity * sizeof(*new_owners));
+        if (new_owners == NULL) {
+            free(base_indices);
+            return false;
+        }
+        if (prefixes->depth != 0) {
+            owners = malloc((size_t)capacity * prefixes->depth);
+            if (owners == NULL) {
+                free(new_owners);
+                free(base_indices);
+                return false;
+            }
+            if (prefixes->count != 0) {
+                memcpy(owners, prefixes->owners,
+                       (size_t)prefixes->count * prefixes->depth);
+            }
+        }
+        if (prefixes->count != 0) {
+            memcpy(base_indices, prefixes->base_indices,
+                   (size_t)prefixes->count * sizeof(*base_indices));
+            memcpy(new_owners, prefixes->new_owners,
+                   (size_t)prefixes->count * sizeof(*new_owners));
+        }
+        free(prefixes->owners);
+        free(prefixes->base_indices);
+        free(prefixes->new_owners);
+        prefixes->owners = owners;
+        prefixes->base_indices = base_indices;
+        prefixes->new_owners = new_owners;
+        prefixes->capacity = capacity;
+    }
+    if (prefixes->depth != 0) {
+        memcpy(prefixes->owners +
+                   (size_t)prefixes->count * prefixes->depth,
+               steps, prefixes->depth);
+    }
+    prefixes->base_indices[prefixes->count] = base_index;
+    prefixes->new_owners[prefixes->count] = (uint8_t)new_owner;
+    ++prefixes->count;
+    return true;
+}
+#endif
+
 static bool collect_prefixes(struct search *search,
                              struct prefix_list *prefixes, uint8_t *steps,
                              unsigned left_depth, unsigned right_depth,
-                             unsigned used_labels)
+                             unsigned used_labels,
+                             unsigned left_column_mask,
+                             unsigned right_column_mask)
 {
     unsigned assigned = left_depth + right_depth;
     unsigned decision_depth = assigned / SEARCH_STEP_FACES;
@@ -1141,9 +2072,11 @@ static bool collect_prefixes(struct search *search,
     }
     ++search->nodes;
 #if MIRROR
-    plan = plan_mirror_pairs(search, used_labels);
+    plan = plan_mirror_pairs(search, used_labels, left_depth, right_depth,
+                             left_column_mask, right_column_mask);
 #else
-    plan = plan_search_end(search, used_labels);
+    plan = plan_search_end(search, used_labels, left_depth, right_depth,
+                           left_column_mask, right_column_mask);
 #endif
     end = plan.end;
     search->negative_prunes += plan.rejected_owners;
@@ -1180,7 +2113,13 @@ static bool collect_prefixes(struct search *search,
                         (MIRROR || end == SEARCH_LEFT ? 1U : 0U),
                     right_depth +
                         (MIRROR || end == SEARCH_RIGHT ? 1U : 0U),
-                    used_labels + (new_label ? 1U : 0U))) {
+                    used_labels + (new_label ? 1U : 0U),
+                    MIRROR || end == SEARCH_LEFT ?
+                        column_mask_after_owner(left_column_mask, owner) :
+                        left_column_mask,
+                    MIRROR || end == SEARCH_RIGHT ?
+                        column_mask_after_owner(right_column_mask, owner) :
+                        right_column_mask)) {
 #if MIRROR
                 undo_mirror_pair(search, owner);
 #else
@@ -1207,13 +2146,13 @@ static bool build_prefixes(struct search *prototype,
     unsigned depth;
 
     for (depth = 1; depth <= SEARCH_DECISION_COUNT; ++depth) {
-        free(prefixes->owners);
+        clear_prefixes(prefixes);
         *prefixes = (struct prefix_list){.depth = depth};
         prototype->nodes = 0;
         prototype->negative_prunes = 0;
         prototype->right_end_prunes = 0;
         prototype->left_end_prunes = 0;
-        if (!collect_prefixes(prototype, prefixes, steps, 0, 0, 0)) {
+        if (!collect_prefixes(prototype, prefixes, steps, 0, 0, 0, 0, 0)) {
             return false;
         }
         if (prefixes->count == 0 || prefixes->count >= desired_jobs ||
@@ -1223,6 +2162,110 @@ static bool build_prefixes(struct search *prototype,
     }
     return false;
 }
+
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+static bool collect_extension_prefixes(
+    struct search *search, struct extension_cursor *cursor,
+    struct prefix_list *prefixes, uint8_t *steps, unsigned decision_depth,
+    uint64_t base_index, unsigned new_owner)
+{
+    struct end_plan plan;
+    unsigned owner;
+
+    if (interrupt_requested) {
+        return false;
+    }
+    if (decision_depth == prefixes->depth) {
+        return append_extension_prefix(
+            prefixes, steps, base_index, new_owner);
+    }
+    if (cursor->left_depth + cursor->right_depth == FACE_COUNT) {
+        return true;
+    }
+    ++search->nodes;
+    plan = plan_extension_end(search, cursor);
+    search->negative_prunes += plan.rejected_owners;
+    for (owner = 0; owner < DICE; ++owner) {
+        bool fixed;
+        bool introduced;
+
+        if ((plan.owner_mask & (1U << owner)) == 0) {
+            continue;
+        }
+        steps[decision_depth] = (uint8_t)owner |
+            (plan.end == SEARCH_RIGHT ? PREFIX_RIGHT_FLAG : 0U);
+        if (!apply_extension_owner(search, cursor, plan.end, owner,
+                                   &fixed, &introduced)) {
+            return false;
+        }
+        if (!collect_extension_prefixes(
+                search, cursor, prefixes, steps, decision_depth + 1U,
+                base_index, new_owner)) {
+            undo_extension_owner(search, cursor, plan.end, owner, fixed,
+                                 introduced);
+            return false;
+        }
+        undo_extension_owner(search, cursor, plan.end, owner, fixed,
+                             introduced);
+    }
+    return true;
+}
+
+static void reset_residual_configuration(struct search *search)
+{
+    size_t state;
+    unsigned owner;
+
+    for (state = 0; state < PERM_STATE_COUNT; ++state) {
+        search->residual[state] =
+            search->target[search->state[state].length];
+    }
+    for (owner = 0; owner < DICE; ++owner) {
+        search->remaining[owner] = SIDES;
+    }
+}
+
+static bool build_extension_prefixes(
+    struct search *prototype, const struct extension_base_list *bases,
+    struct prefix_list *prefixes, uint64_t desired_jobs)
+{
+    uint8_t steps[FACE_COUNT];
+    unsigned depth;
+
+    for (depth = 0; depth < FACE_COUNT; ++depth) {
+        uint64_t base_index;
+
+        clear_prefixes(prefixes);
+        prefixes->depth = depth;
+        prototype->nodes = 0;
+        prototype->negative_prunes = 0;
+        prototype->right_end_prunes = 0;
+        prototype->left_end_prunes = 0;
+        for (base_index = 0; base_index < bases->count; ++base_index) {
+            unsigned new_owner;
+
+            for (new_owner = 0; new_owner < DICE; ++new_owner) {
+                struct extension_cursor cursor;
+
+                reset_residual_configuration(prototype);
+                initialize_extension_cursor(
+                    &bases->items[base_index], new_owner, &cursor);
+                if (!collect_extension_prefixes(
+                        prototype, &cursor, prefixes, steps, 0, base_index,
+                        new_owner)) {
+                    return false;
+                }
+            }
+        }
+        if (prefixes->count == 0 || prefixes->count >= desired_jobs ||
+            depth + 1U == FACE_COUNT) {
+            reset_residual_configuration(prototype);
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 static void shuffle_jobs(struct shared_state *shared)
 {
@@ -1256,15 +2299,21 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
     unsigned used_labels = 0;
     unsigned left_depth = 0;
     unsigned right_depth = 0;
+    unsigned left_column_mask = 0;
+    unsigned right_column_mask = 0;
     unsigned applied = 0;
     unsigned depth;
 
     for (depth = 0; depth < prefixes->depth; ++depth) {
         uint8_t step = prefix[depth];
 #if MIRROR
-        struct end_plan plan = plan_mirror_pairs(search, used_labels);
+        struct end_plan plan = plan_mirror_pairs(
+            search, used_labels, left_depth, right_depth,
+            left_column_mask, right_column_mask);
 #else
-        struct end_plan plan = plan_search_end(search, used_labels);
+        struct end_plan plan = plan_search_end(
+            search, used_labels, left_depth, right_depth,
+            left_column_mask, right_column_mask);
 #endif
         enum search_end end = (step & PREFIX_RIGHT_FLAG) != 0
             ? SEARCH_RIGHT : SEARCH_LEFT;
@@ -1302,12 +2351,21 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
         ++applied;
         left_depth += MIRROR || end == SEARCH_LEFT;
         right_depth += MIRROR || end == SEARCH_RIGHT;
+        if (MIRROR || end == SEARCH_LEFT) {
+            left_column_mask = column_mask_after_owner(left_column_mask,
+                                                       owner);
+        }
+        if (MIRROR || end == SEARCH_RIGHT) {
+            right_column_mask = column_mask_after_owner(right_column_mask,
+                                                        owner);
+        }
         if ((MIRROR || end == SEARCH_LEFT) && owner == used_labels) {
             ++used_labels;
         }
     }
     if (!search->internal_error) {
-        search_configurations(search, left_depth, right_depth, used_labels);
+        search_configurations(search, left_depth, right_depth, used_labels,
+                              left_column_mask, right_column_mask);
     }
     while (applied > 0) {
         uint8_t step;
@@ -1328,12 +2386,101 @@ static bool run_prefix(struct search *search, uint64_t prefix_index)
     return !search_should_stop(search);
 }
 
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+static bool run_extension_prefix(struct search *search,
+                                 uint64_t prefix_index)
+{
+    const struct prefix_list *prefixes = &search->shared->prefixes;
+    const uint8_t *prefix = prefixes->depth == 0 ? NULL :
+        prefixes->owners + (size_t)prefix_index * prefixes->depth;
+    uint64_t base_index = prefixes->base_indices[prefix_index];
+    unsigned new_owner = prefixes->new_owners[prefix_index];
+    const struct extension_base *base;
+    bool fixed_step[FACE_COUNT];
+    bool introduced_step[FACE_COUNT];
+    struct extension_cursor cursor;
+    unsigned applied = 0;
+    unsigned depth;
+
+    if (base_index >= search->shared->extension_bases.count ||
+        new_owner >= DICE) {
+        search->internal_error = true;
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        return false;
+    }
+    base = &search->shared->extension_bases.items[base_index];
+    initialize_extension_cursor(base, new_owner, &cursor);
+    for (depth = 0; depth < prefixes->depth; ++depth) {
+        uint8_t step = prefix[depth];
+        enum search_end end = (step & PREFIX_RIGHT_FLAG) != 0
+            ? SEARCH_RIGHT : SEARCH_LEFT;
+        unsigned owner = step & ~PREFIX_RIGHT_FLAG;
+        struct end_plan plan = plan_extension_end(search, &cursor);
+
+        if (owner >= DICE || end != plan.end ||
+            (plan.owner_mask & (1U << owner)) == 0 ||
+            !apply_extension_owner(
+                search, &cursor, end, owner, &fixed_step[depth],
+                &introduced_step[depth])) {
+            search->internal_error = true;
+            atomic_store_explicit(&search->shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&search->shared->stop, true,
+                                  memory_order_relaxed);
+            break;
+        }
+        ++applied;
+    }
+    if (!search->internal_error) {
+        search_extensions(search, &cursor);
+    }
+    while (applied > 0) {
+        uint8_t step;
+        enum search_end end;
+        unsigned owner;
+
+        --applied;
+        step = prefix[applied];
+        end = (step & PREFIX_RIGHT_FLAG) != 0
+            ? SEARCH_RIGHT : SEARCH_LEFT;
+        owner = step & ~PREFIX_RIGHT_FLAG;
+        undo_extension_owner(search, &cursor, end, owner,
+                             fixed_step[applied],
+                             introduced_step[applied]);
+    }
+    return !search_should_stop(search);
+}
+
+static bool run_extension_job(struct worker *worker, uint64_t job)
+{
+    uint64_t begin;
+    uint64_t end;
+    uint64_t prefix;
+
+    job_prefix_range(worker->shared, job, &begin, &end);
+    for (prefix = begin; prefix < end; ++prefix) {
+        if (!run_extension_prefix(&worker->search, prefix)) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
 static bool run_job(struct worker *worker, uint64_t job)
 {
     uint64_t begin;
     uint64_t end;
     uint64_t prefix;
 
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+    if (worker->shared->options.extend_solutions_path != NULL) {
+        return run_extension_job(worker, job);
+    }
+#endif
     job_prefix_range(worker->shared, job, &begin, &end);
     for (prefix = begin; prefix < end; ++prefix) {
         if (!run_prefix(&worker->search, prefix)) {
@@ -1446,6 +2593,8 @@ static struct totals collect_totals(const struct shared_state *shared,
         .left_end_prunes = shared->setup_left_end_prunes,
         .configurations = atomic_load_explicit(
             &shared->configurations, memory_order_relaxed),
+        .duplicate_configurations = atomic_load_explicit(
+            &shared->duplicate_configurations, memory_order_relaxed),
     };
     unsigned worker;
 
@@ -1475,8 +2624,10 @@ static void drain_solutions(struct shared_state *shared)
         struct solution *next = solution->next;
 
         printf("permutation-fair #%" PRIu64
-               " depth=%dd%d mirror=%d encoding=%s\n",
-               solution->number, DICE, SIDES, MIRROR,
+               " depth=%dd%d mirror=%d column-group=%d extension=%d "
+               "encoding=%s\n",
+               solution->number, DICE, SIDES, MIRROR, COLUMN_GROUP,
+               shared->options.extend_solutions_path != NULL,
                solution->encoding);
         free(solution);
         solution = next;
@@ -1496,25 +2647,41 @@ static void print_progress(const struct shared_state *shared,
                                            memory_order_relaxed);
     char nodes[SI_COUNT_TEXT_SIZE];
     char negative_prunes[SI_COUNT_TEXT_SIZE];
+#if !MIRROR
     char right_end_prunes[SI_COUNT_TEXT_SIZE];
     char left_end_prunes[SI_COUNT_TEXT_SIZE];
+#endif
     char configurations[SI_COUNT_TEXT_SIZE];
+    char duplicate_configurations[SI_COUNT_TEXT_SIZE];
 
     format_si_count(nodes, totals.nodes);
     format_si_count(negative_prunes, totals.negative_prunes);
+#if !MIRROR
     format_si_count(right_end_prunes, totals.right_end_prunes);
     format_si_count(left_end_prunes, totals.left_end_prunes);
+#endif
     format_si_count(configurations, totals.configurations);
+    format_si_count(duplicate_configurations,
+                    totals.duplicate_configurations);
 
     fprintf(stderr,
             "%sprogress: %.1fs, workers=%u, jobs=%" PRIu64 "/%" PRIu64
-            ", nodes=%s, negative-prunes=%s"
-            ", right-end-prunes=%s, left-end-prunes=%s"
-            ", permutation-fair=%s%s",
+            ", nodes=%s, negative-prunes=%s",
             terminal ? "\r" : "", monotonic_seconds() - start_time, active,
-            jobs_done, shared->job_count, nodes, negative_prunes,
-            right_end_prunes, left_end_prunes, configurations,
-            terminal ? "\033[K" : "\n");
+            jobs_done, shared->job_count, nodes, negative_prunes);
+#if !MIRROR
+    if (shared->options.extend_solutions_path == NULL) {
+        fprintf(stderr, ", right-end-prunes=%s, left-end-prunes=%s",
+                right_end_prunes, left_end_prunes);
+    }
+#endif
+    fprintf(stderr, ", permutation-fair=%s%s", configurations,
+            shared->options.extend_solutions_path != NULL ?
+                ", duplicate-results=" : "");
+    if (shared->options.extend_solutions_path != NULL) {
+        fprintf(stderr, "%s", duplicate_configurations);
+    }
+    fputs(terminal ? "\033[K" : "\n", stderr);
     fflush(stderr);
 }
 
@@ -1523,7 +2690,9 @@ static void watch_workers(struct shared_state *shared,
                           unsigned worker_count, double start_time)
 {
     const bool terminal = isatty(STDERR_FILENO) != 0;
-    double next_status = monotonic_seconds() + 1.0;
+    const double progress_seconds =
+        (double)shared->options.progress_seconds;
+    double next_status = monotonic_seconds() + progress_seconds;
     bool printed_status = false;
 
     pthread_mutex_lock(&shared->event_mutex);
@@ -1539,13 +2708,22 @@ static void watch_workers(struct shared_state *shared,
         }
         drain_solutions(shared);
         now = monotonic_seconds();
-        if (now >= next_status) {
+        if (progress_seconds != 0.0 && now >= next_status) {
             print_progress(shared, workers, worker_count, start_time,
                            terminal);
             printed_status = true;
-            next_status = now + 1.0;
+            next_status = now + progress_seconds;
         }
-        wait_seconds = next_status - monotonic_seconds();
+        /* Wake at least once a second so Ctrl-C remains responsive even
+         * when progress output is disabled or has a long interval. */
+        wait_seconds = 1.0;
+        if (progress_seconds != 0.0) {
+            double until_status = next_status - monotonic_seconds();
+
+            if (until_status < wait_seconds) {
+                wait_seconds = until_status;
+            }
+        }
         if (wait_seconds < 0.001) {
             wait_seconds = 0.001;
         }
@@ -1589,6 +2767,18 @@ int main(int argc, char **argv)
         usage(stderr, argv[0]);
         return EXIT_FAILURE;
     }
+    if (options.extend_solutions_path != NULL && (MIRROR || COLUMN_GROUP)) {
+        fputs("--extend-solutions requires MIRROR=0 and COLUMN_GROUP=0.\n",
+              stderr);
+        return EXIT_FAILURE;
+    }
+#if !RESIDUAL_EXTENSION
+    if (options.extend_solutions_path != NULL) {
+        fputs("This residual_search build does not include extension search; "
+              "rebuild with RESIDUAL_EXTENSION=1.\n", stderr);
+        return EXIT_FAILURE;
+    }
+#endif
     if (options.threads == 0) {
         options.threads = online_cpu_count();
     }
@@ -1623,9 +2813,13 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     if (!prototype.possible) {
-        fputs("Search complete: 0.000s, nodes=0, negative-prunes=0, "
-              "right-end-prunes=0, left-end-prunes=0, "
-              "permutation-fair=0\n", stderr);
+        fputs("Search complete: 0.000s, nodes=0, negative-prunes=0", stderr);
+#if !MIRROR
+        if (options.extend_solutions_path == NULL) {
+            fputs(", right-end-prunes=0, left-end-prunes=0", stderr);
+        }
+#endif
+        fputs(", permutation-fair=0\n", stderr);
         return EXIT_SUCCESS;
     }
     for (owner = 0; owner < DICE; ++owner) {
@@ -1633,23 +2827,54 @@ int main(int argc, char **argv)
     }
     prototype.encoding[FACE_COUNT] = '\0';
     start_time = monotonic_seconds();
-    if (!build_prefixes(&prototype, &shared.prefixes, desired_jobs)) {
-        if (interrupt_requested) {
-            fprintf(stderr,
-                    "Search interrupted during prefix-job setup: %.3fs, "
-                    "configuration=%dd%d, mirror=%d, order=%s",
-                    monotonic_seconds() - start_time, DICE, SIDES,
-                    MIRROR,
-                    options.random_order ? "random" : "canonical");
-            if (options.random_order) {
-                fprintf(stderr, ", seed=%" PRIu64, options.seed);
-            }
-            fputc('\n', stderr);
-        } else {
-            fputs("Unable to build residual-search prefix jobs.\n", stderr);
-        }
-        free(shared.prefixes.owners);
+#if RESIDUAL_EXTENSION
+    if (options.extend_solutions_path != NULL &&
+        !load_extension_bases(options.extend_solutions_path, &prototype,
+                              &shared.extension_bases)) {
         return interrupt_requested ? 128 + SIGINT : EXIT_FAILURE;
+    }
+#endif
+    {
+        bool prefixes_built;
+
+#if RESIDUAL_EXTENSION && !MIRROR && !COLUMN_GROUP
+        prefixes_built = options.extend_solutions_path != NULL
+            ? build_extension_prefixes(
+                  &prototype, &shared.extension_bases, &shared.prefixes,
+                  desired_jobs)
+            : build_prefixes(&prototype, &shared.prefixes, desired_jobs);
+#else
+        prefixes_built = build_prefixes(&prototype, &shared.prefixes,
+                                        desired_jobs);
+#endif
+        if (!prefixes_built) {
+            if (interrupt_requested) {
+                fprintf(stderr,
+                        "Search interrupted during prefix-job setup: %.3fs, "
+                        "configuration=%dd%d, mirror=%d, column-group=%d, "
+                        "order=%s",
+                        monotonic_seconds() - start_time, DICE, SIDES,
+                        MIRROR, COLUMN_GROUP,
+                        options.random_order ? "random" : "canonical");
+                if (options.random_order) {
+                    fprintf(stderr, ", seed=%" PRIu64, options.seed);
+                }
+                if (options.extend_solutions_path != NULL) {
+                    fprintf(stderr, ", mode=extension, bases=%" PRIu64
+                            ", positions-per-base=%u, input=%s",
+                            shared.extension_bases.count,
+                            DICE,
+                            options.extend_solutions_path);
+                }
+                fputc('\n', stderr);
+            } else {
+                fputs("Unable to build residual-search prefix jobs.\n",
+                      stderr);
+            }
+            clear_prefixes(&shared.prefixes);
+            free_extension_bases(&shared.extension_bases);
+            return interrupt_requested ? 128 + SIGINT : EXIT_FAILURE;
+        }
     }
     shared.options = options;
     shared.setup_nodes = prototype.nodes;
@@ -1667,14 +2892,16 @@ int main(int argc, char **argv)
     if (shared.job_count != 0) {
         if (shared.job_count > SIZE_MAX / sizeof(*shared.job_order)) {
             fputs("Job-order table is too large.\n", stderr);
-            free(shared.prefixes.owners);
+            clear_prefixes(&shared.prefixes);
+            free_extension_bases(&shared.extension_bases);
             return EXIT_FAILURE;
         }
         shared.job_order = malloc((size_t)shared.job_count *
                                   sizeof(*shared.job_order));
         if (shared.job_order == NULL) {
             fputs("Unable to allocate job-order table.\n", stderr);
-            free(shared.prefixes.owners);
+            clear_prefixes(&shared.prefixes);
+            free_extension_bases(&shared.extension_bases);
             return EXIT_FAILURE;
         }
         for (uint64_t job = 0; job < shared.job_count; ++job) {
@@ -1687,6 +2914,7 @@ int main(int argc, char **argv)
     atomic_init(&shared.next_job, 0);
     atomic_init(&shared.jobs_done, 0);
     atomic_init(&shared.configurations, 0);
+    atomic_init(&shared.duplicate_configurations, 0);
     atomic_init(&shared.active_workers, 0);
     atomic_init(&shared.stop, false);
     atomic_init(&shared.internal_error, false);
@@ -1694,14 +2922,16 @@ int main(int argc, char **argv)
     if (pthread_mutex_init(&shared.solution_mutex, NULL) != 0) {
         fputs("Unable to initialize solution mutex.\n", stderr);
         free(shared.job_order);
-        free(shared.prefixes.owners);
+        clear_prefixes(&shared.prefixes);
+        free_extension_bases(&shared.extension_bases);
         return EXIT_FAILURE;
     }
     if (pthread_mutex_init(&shared.event_mutex, NULL) != 0) {
         fputs("Unable to initialize worker-event mutex.\n", stderr);
         pthread_mutex_destroy(&shared.solution_mutex);
         free(shared.job_order);
-        free(shared.prefixes.owners);
+        clear_prefixes(&shared.prefixes);
+        free_extension_bases(&shared.extension_bases);
         return EXIT_FAILURE;
     }
     if (pthread_cond_init(&shared.event_condition, NULL) != 0) {
@@ -1709,7 +2939,8 @@ int main(int argc, char **argv)
         pthread_mutex_destroy(&shared.event_mutex);
         pthread_mutex_destroy(&shared.solution_mutex);
         free(shared.job_order);
-        free(shared.prefixes.owners);
+        clear_prefixes(&shared.prefixes);
+        free_extension_bases(&shared.extension_bases);
         return EXIT_FAILURE;
     }
     worker_count = options.threads;
@@ -1742,20 +2973,61 @@ int main(int argc, char **argv)
         atomic_init(&workers[worker].stats.left_end_prunes, 0);
     }
 
-    fprintf(stderr,
-            "Searching essentially different %s%dd%d configurations by "
-            "residual-prefix search (%u states; %s) with "
-            "%u pthread workers (%" PRIu64 " jobs over %" PRIu64
-            " prefixes, split depth %u %s; order=%s",
-            MIRROR ? "mirrored " : "", DICE, SIDES, PERM_STATE_COUNT,
-            MIRROR ? "forced mirror-pair peeling" :
-            RESIDUAL_TWO_END_SEARCH ? "two-end fail-first enabled" :
-            RESIDUAL_RIGHT_END_CHECK ? "right-end checks enabled" :
-                                       "left-only peeling",
-            worker_count, shared.job_count, shared.prefixes.count,
-            shared.prefixes.depth,
-            MIRROR ? "mirrored pairs" : "faces",
-            options.random_order ? "random" : "canonical");
+    if (options.extend_solutions_path != NULL) {
+        fprintf(stderr,
+                "Extending %" PRIu64 " canonical %u-die bases",
+                shared.extension_bases.count, BASE_DICE);
+        if (shared.extension_bases.minimum_sides ==
+            shared.extension_bases.maximum_sides) {
+            fprintf(stderr, " with %u sides",
+                    shared.extension_bases.minimum_sides);
+        } else {
+            fprintf(stderr, " with %u-%u sides",
+                    shared.extension_bases.minimum_sides,
+                    shared.extension_bases.maximum_sides);
+        }
+        fprintf(stderr,
+                " to %dd%d by residual extension search (%u states; "
+                "two-end fail-first; %u new-die positions/base) with %u "
+                "pthread workers (%" PRIu64
+                " jobs over %" PRIu64 " prefixes, split depth %u moves; "
+                "order=%s, input=%s",
+                DICE, SIDES, PERM_STATE_COUNT, DICE, worker_count,
+                shared.job_count, shared.prefixes.count,
+                shared.prefixes.depth,
+                options.random_order ? "random" : "canonical",
+                options.extend_solutions_path);
+        if (shared.extension_bases.duplicate_count != 0) {
+            fprintf(stderr, ", duplicate-bases=%" PRIu64,
+                    shared.extension_bases.duplicate_count);
+        }
+        if (shared.extension_bases.lesser_count != 0) {
+            fprintf(stderr, ", lesser-records=%" PRIu64,
+                    shared.extension_bases.lesser_count);
+        }
+        if (shared.extension_bases.same_side_nonfair_count != 0) {
+            fprintf(stderr, ", same-side-nonfair-skipped=%" PRIu64,
+                    shared.extension_bases.same_side_nonfair_count);
+        }
+    } else {
+        fprintf(stderr,
+                "Searching essentially different %s%s%dd%d configurations "
+                "by residual-prefix search (%u states; %s; column-group=%d) "
+                "with %u pthread workers (%" PRIu64 " jobs over %" PRIu64
+                " prefixes, split depth %u %s; order=%s",
+                MIRROR ? "mirrored " : "",
+                COLUMN_GROUP ? "column-grouped " : "", DICE, SIDES,
+                PERM_STATE_COUNT,
+                MIRROR ? "forced mirror-pair peeling" :
+                RESIDUAL_TWO_END_SEARCH ? "two-end fail-first enabled" :
+                RESIDUAL_RIGHT_END_CHECK ? "right-end checks enabled" :
+                                           "left-only peeling",
+                COLUMN_GROUP,
+                worker_count, shared.job_count, shared.prefixes.count,
+                shared.prefixes.depth,
+                MIRROR ? "mirrored pairs" : "faces",
+                options.random_order ? "random" : "canonical");
+    }
     if (options.random_order) {
         fprintf(stderr, ", seed=%" PRIu64, options.seed);
     }
@@ -1808,15 +3080,22 @@ int main(int argc, char **argv)
         const char *status;
         char nodes[SI_COUNT_TEXT_SIZE];
         char negative_prunes[SI_COUNT_TEXT_SIZE];
+#if !MIRROR
         char right_end_prunes[SI_COUNT_TEXT_SIZE];
         char left_end_prunes[SI_COUNT_TEXT_SIZE];
+#endif
         char configurations[SI_COUNT_TEXT_SIZE];
+        char duplicate_configurations[SI_COUNT_TEXT_SIZE];
 
         format_si_count(nodes, totals.nodes);
         format_si_count(negative_prunes, totals.negative_prunes);
+#if !MIRROR
         format_si_count(right_end_prunes, totals.right_end_prunes);
         format_si_count(left_end_prunes, totals.left_end_prunes);
+#endif
         format_si_count(configurations, totals.configurations);
+        format_si_count(duplicate_configurations,
+                        totals.duplicate_configurations);
 
         if (!interrupt_requested && !node_limit_reached &&
             !solution_limit_reached && exit_status == EXIT_SUCCESS &&
@@ -1832,24 +3111,42 @@ int main(int argc, char **argv)
 
         fprintf(stderr,
                 "%s: %.3fs, configuration=%dd%d, workers=%u, jobs=%" PRIu64
-                "/%" PRIu64 ", mirror=%d, split-depth=%u, split-unit=%s, "
-                "order=%s",
+                "/%" PRIu64 ", mirror=%d, column-group=%d, split-depth=%u, "
+                "split-unit=%s, order=%s",
                 status, monotonic_seconds() - start_time, DICE, SIDES,
                 worker_count, jobs_done, shared.job_count,
-                MIRROR,
+                MIRROR, COLUMN_GROUP,
                 shared.prefixes.depth,
-                MIRROR ? "pairs" : "faces",
+                options.extend_solutions_path != NULL ? "moves" :
+                (MIRROR ? "pairs" : "faces"),
                 options.random_order ? "random" : "canonical");
         if (options.random_order) {
             fprintf(stderr, ", seed=%" PRIu64, options.seed);
         }
+        if (options.extend_solutions_path != NULL) {
+            fprintf(stderr,
+                    ", mode=extension, bases=%" PRIu64
+                    ", positions-per-base=%u, input=%s",
+                    shared.extension_bases.count,
+                    DICE,
+                    options.extend_solutions_path);
+        }
         fprintf(stderr,
-                ", nodes=%s, negative-prunes=%s"
-                ", right-end-prunes=%s"
-                ", left-end-prunes=%s"
-                ", permutation-fair=%s\n",
-                nodes, negative_prunes, right_end_prunes, left_end_prunes,
-                configurations);
+                ", nodes=%s, negative-prunes=%s",
+                nodes, negative_prunes);
+#if !MIRROR
+        if (options.extend_solutions_path == NULL) {
+            fprintf(stderr,
+                    ", right-end-prunes=%s, left-end-prunes=%s",
+                    right_end_prunes, left_end_prunes);
+        }
+#endif
+        fprintf(stderr, ", permutation-fair=%s", configurations);
+        if (options.extend_solutions_path != NULL) {
+            fprintf(stderr, ", duplicate-results=%s",
+                    duplicate_configurations);
+        }
+        fputc('\n', stderr);
     }
     if (interrupt_requested && exit_status == EXIT_SUCCESS) {
         exit_status = 128 + SIGINT;
@@ -1859,7 +3156,9 @@ cleanup:
     drain_solutions(&shared);
     free(workers);
     free(shared.job_order);
-    free(shared.prefixes.owners);
+    clear_prefixes(&shared.prefixes);
+    free_extension_bases(&shared.extension_bases);
+    free_solution_set(&shared.extension_solutions);
     pthread_cond_destroy(&shared.event_condition);
     pthread_mutex_destroy(&shared.event_mutex);
     pthread_mutex_destroy(&shared.solution_mutex);
