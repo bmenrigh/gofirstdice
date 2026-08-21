@@ -1042,6 +1042,59 @@ def analyze_exact_row_joins(dice: int, sides: int) -> None:
         )
 
 
+def conditioned_correlation_degree(
+    feature: Feature, fixed_dice: int
+) -> int:
+    """Degree left after rows [0, fixed_dice) have been fixed.
+
+    A within-column indicator is constant exactly when its block contains
+    only already-built dice.  Every other block depends on the choice made
+    for one of the remaining rows in that physical column.
+    """
+
+    return sum(
+        any(owner >= fixed_dice for owner in block)
+        for block in feature.blocks
+    )
+
+
+def conditionally_linear_full_directions(
+    order: int, fixed_dice: int
+) -> list[str]:
+    """Full-order equations that become additive after fixing early rows."""
+
+    permutations = list(itertools.permutations(range(order)))
+    expansions = [collision_expansion(word) for word in permutations]
+    result: list[str] = []
+    for direction in simple_fairness_directions(permutations):
+        expansion = combine_expansions(direction.coefficients, expansions)
+        degree = max(
+            (
+                conditioned_correlation_degree(feature, fixed_dice)
+                for feature in expansion
+            ),
+            default=0,
+        )
+        if degree <= 1:
+            result.append(direction.name)
+    return result
+
+
+def analyze_conditioned_completion(dice: int) -> None:
+    if dice < 4:
+        return
+    fixed_dice = dice - 2
+    directions = conditionally_linear_full_directions(dice, fixed_dice)
+    print(
+        "Conditioned final-row identities:\n"
+        f"  after rows A..{owner_name(fixed_dice - 1)} are fixed, "
+        f"{len(directions)} of {math.factorial(dice) - 1} full-order "
+        "fairness directions become exactly additive"
+    )
+    if len(directions) <= 24:
+        print("  " + ", ".join(directions))
+
+
 def encoding_to_columns(
     text: str, dice: int, sides: int
 ) -> tuple[list[int], list[Word]]:
@@ -1378,6 +1431,7 @@ def main() -> int:
         )
         analyze_place_contributions(arguments.dice, arguments.sides)
         analyze_exact_row_joins(arguments.dice, arguments.sides)
+        analyze_conditioned_completion(arguments.dice)
 
         for theory in theories:
             target_numerator = arguments.sides ** theory.order
