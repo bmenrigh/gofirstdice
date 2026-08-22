@@ -92,6 +92,46 @@
 #define C_MITM 0
 #endif
 
+#ifndef AB_RESIDUAL_PERM
+#define AB_RESIDUAL_PERM 1
+#endif
+
+#ifndef AB_RESIDUAL_BOUNDS
+#define AB_RESIDUAL_BOUNDS 1
+#endif
+
+#ifndef AB_RESIDUAL_COLUMN_ORDER
+#define AB_RESIDUAL_COLUMN_ORDER 1
+#endif
+
+#ifndef AB_RESIDUAL_COLUMN_ORDER_PRIMARY
+#define AB_RESIDUAL_COLUMN_ORDER_PRIMARY 0
+#endif
+
+#ifndef AB_RESIDUAL_LINEAR_BOUNDS
+#define AB_RESIDUAL_LINEAR_BOUNDS 0
+#endif
+
+#ifndef AB_RESIDUAL_LINEAR_BOUND_STRIDE
+#define AB_RESIDUAL_LINEAR_BOUND_STRIDE 2
+#endif
+
+#ifndef AB_RESIDUAL_LINEAR_BOUND_START
+#define AB_RESIDUAL_LINEAR_BOUND_START (SEARCH_COLUMNS / 2U)
+#endif
+
+#ifndef AB_RESIDUAL_LINEAR_FULL_PAIRS
+#define AB_RESIDUAL_LINEAR_FULL_PAIRS 0
+#endif
+
+#ifndef ABC_RESIDUAL_PERM
+#define ABC_RESIDUAL_PERM 1
+#endif
+
+#ifndef TRACK_TIME
+#define TRACK_TIME 0
+#endif
+
 #ifndef MIRROR_COLUMNS
 #if MIRROR
 #define MIRROR_COLUMNS (SIDES / 2)
@@ -163,8 +203,74 @@
 #error "C_COMPLETION_COUPLED must be either zero or one"
 #endif
 
+#if INCREMENTAL_C_COMPLETION_COUPLED && !INCREMENTAL_C_COMPLETION
+#error "C_COMPLETION_COUPLED=1 requires C_COMPLETION=1"
+#endif
+
 #if C_MITM != 0 && C_MITM != 1
 #error "C_MITM must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_PERM != 0 && AB_RESIDUAL_PERM != 1
+#error "AB_RESIDUAL_PERM must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_BOUNDS != 0 && AB_RESIDUAL_BOUNDS != 1
+#error "AB_RESIDUAL_BOUNDS must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_BOUNDS && !AB_RESIDUAL_PERM
+#error "ABR_BOUNDS=1 requires AB_RESIDUAL=1"
+#endif
+
+#if AB_RESIDUAL_COLUMN_ORDER != 0 && AB_RESIDUAL_COLUMN_ORDER != 1
+#error "ABR_ORDER must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_COLUMN_ORDER && !AB_RESIDUAL_BOUNDS
+#error "ABR_ORDER=1 requires ABR_BOUNDS=1"
+#endif
+
+#if AB_RESIDUAL_COLUMN_ORDER_PRIMARY != 0 && \
+    AB_RESIDUAL_COLUMN_ORDER_PRIMARY != 1
+#error "ABR_ORDER_PRIMARY must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_COLUMN_ORDER_PRIMARY && !AB_RESIDUAL_COLUMN_ORDER
+#error "ABR_ORDER_PRIMARY=1 requires ABR_ORDER=1"
+#endif
+
+#if AB_RESIDUAL_LINEAR_BOUNDS != 0 && AB_RESIDUAL_LINEAR_BOUNDS != 1
+#error "ABR_LINEAR must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_LINEAR_BOUNDS && !AB_RESIDUAL_BOUNDS
+#error "ABR_LINEAR=1 requires ABR_BOUNDS=1"
+#endif
+
+#if AB_RESIDUAL_LINEAR_FULL_PAIRS != 0 && \
+    AB_RESIDUAL_LINEAR_FULL_PAIRS != 1
+#error "ABR_LINEAR_FULL must be either zero or one"
+#endif
+
+#if AB_RESIDUAL_LINEAR_FULL_PAIRS && !AB_RESIDUAL_LINEAR_BOUNDS
+#error "ABR_LINEAR_FULL=1 requires ABR_LINEAR=1"
+#endif
+
+#if AB_RESIDUAL_LINEAR_BOUND_STRIDE < 1
+#error "ABR_LINEAR_STRIDE must be at least one"
+#endif
+
+#if AB_RESIDUAL_LINEAR_BOUND_START > SEARCH_COLUMNS
+#error "ABR_LINEAR_START exceeds the searched columns"
+#endif
+
+#if ABC_RESIDUAL_PERM != 0 && ABC_RESIDUAL_PERM != 1
+#error "ABC_RESIDUAL_PERM must be either zero or one"
+#endif
+
+#if TRACK_TIME != 0 && TRACK_TIME != 1
+#error "TRACK_TIME must be either zero or one"
 #endif
 
 #if ROW2_MITM && \
@@ -213,6 +319,16 @@
     (CONDITIONED_COMPLETION_BOUNDS_ACTIVE && DICE == 5 && \
      INCREMENTAL_C_COMPLETION)
 #define C_MITM_ACTIVE (C_MITM && DICE == 5 && ROW2_MITM_ACTIVE)
+#define AB_RESIDUAL_PERM_ACTIVE \
+    (AB_RESIDUAL_PERM && PERM_ONLY && DICE == 5)
+#define AB_RESIDUAL_BOUNDS_ACTIVE \
+    (AB_RESIDUAL_BOUNDS && AB_RESIDUAL_PERM_ACTIVE)
+#define AB_RESIDUAL_COLUMN_ORDER_ACTIVE \
+    (AB_RESIDUAL_COLUMN_ORDER && AB_RESIDUAL_BOUNDS_ACTIVE)
+#define AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE \
+    (AB_RESIDUAL_LINEAR_BOUNDS && AB_RESIDUAL_BOUNDS_ACTIVE)
+#define ABC_RESIDUAL_PERM_ACTIVE \
+    (ABC_RESIDUAL_PERM && PERM_ONLY && DICE == 5)
 
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
@@ -256,6 +372,19 @@
 #define C_MITM_FILTER_BUCKETS_PER_WORD 32U
 #define C_MITM_FILTER_FINGERPRINT_SHIFT 32U
 #define C_MITM_PREFETCH_BATCH 512U
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+#define ABR_BOUND_COORDINATES 5U
+#define ABR_PERMUTATION_COORDINATES 6U
+#if AB_RESIDUAL_LINEAR_FULL_PAIRS
+#define ABR_DIRECTION_COUNT \
+    ((ABR_PERMUTATION_COORDINATES * \
+      (ABR_PERMUTATION_COORDINATES - 1U)) / 2U)
+#define ABR_DIRECTION_STORAGE 16U
+#else
+#define ABR_DIRECTION_COUNT ABR_BOUND_COORDINATES
+#define ABR_DIRECTION_STORAGE 8U
+#endif
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if DICE == 4
@@ -389,6 +518,10 @@ _Static_assert(LINEAR_BOUND_START <= SEARCH_COLUMNS,
                "LINEAR_BOUND_START exceeds the searched columns");
 _Static_assert(LINEAR_BOUND_STRIDE > 0,
                "LINEAR_BOUND_STRIDE must be positive");
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+_Static_assert(ABR_DIRECTION_STORAGE >= ABR_DIRECTION_COUNT,
+               "ABR direction storage is too small");
+#endif
 _Static_assert(ADDITIVE_PERM_LINEAR_BOUND_STRIDE > 0,
                "ADDITIVE_PERM_LINEAR_BOUND_STRIDE must be positive");
 _Static_assert(SOLUTION_FLUSH_THRESHOLD <= SOLUTION_QUEUE_CAPACITY,
@@ -489,6 +622,26 @@ struct additive_perm_bounds {
 
 struct shared_state;
 struct worker_stats;
+
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+struct ab_residual_bounds {
+    int64_t delta[SEARCH_COLUMNS][DICE][ABR_BOUND_COORDINATES];
+#if AB_RESIDUAL_COLUMN_ORDER_ACTIVE
+    uint64_t order_score[SEARCH_COLUMNS];
+#endif
+    int64_t minimum_left[SEARCH_COLUMNS + 1U][ABR_BOUND_COORDINATES];
+    int64_t maximum_left[SEARCH_COLUMNS + 1U][ABR_BOUND_COORDINATES];
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    int64_t direction_minimum_left[SEARCH_COLUMNS + 1U]
+                                  [ABR_DIRECTION_STORAGE];
+    int64_t direction_maximum_left[SEARCH_COLUMNS + 1U]
+                                  [ABR_DIRECTION_STORAGE];
+#endif
+    int64_t tally[ABR_BOUND_COORDINATES];
+    int64_t goal;
+    int64_t total;
+};
+#endif
 
 #if ROW2_MITM_ACTIVE
 struct row2_mitm_entry {
@@ -646,12 +799,32 @@ struct search {
     uint64_t nodes;
     /* Nonfinal rows count transitions; the forced final row counts checks. */
     uint64_t completed_rows[DICE];
+#if TRACK_TIME
+    uint64_t row_time_ns[DICE];
+    uint64_t time_started_ns;
+    unsigned timed_row;
+    bool time_active;
+#endif
 #if ROW2_MITM_ACTIVE
     uint64_t mitm_solves;
 #endif
 #if C_MITM_ACTIVE
     uint64_t c_mitm_solves;
     uint64_t c_mitm_matches;
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    uint64_t ab_residual_checks;
+    uint64_t ab_residual_prunes;
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    uint64_t ab_residual_bound_prunes;
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    uint64_t ab_residual_linear_prunes;
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    uint64_t abc_residual_checks;
+    uint64_t abc_residual_prunes;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     uint64_t completion_checks;
@@ -683,17 +856,38 @@ struct search {
     uint64_t all_subset_place_prunes;
     uint64_t all_subset_place_fair_count;
     uint64_t permutation_fair_count;
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    /* Keep experimental ABR tables from perturbing the main hot-state layout. */
+    struct ab_residual_bounds abr_bounds;
+#endif
 };
 
 struct worker_stats {
     atomic_uint_fast64_t nodes;
     atomic_uint_fast64_t completed_rows[DICE];
+#if TRACK_TIME
+    atomic_uint_fast64_t row_time_ns[DICE];
+#endif
 #if ROW2_MITM_ACTIVE
     atomic_uint_fast64_t mitm_solves;
 #endif
 #if C_MITM_ACTIVE
     atomic_uint_fast64_t c_mitm_solves;
     atomic_uint_fast64_t c_mitm_matches;
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    atomic_uint_fast64_t ab_residual_checks;
+    atomic_uint_fast64_t ab_residual_prunes;
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    atomic_uint_fast64_t ab_residual_bound_prunes;
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    atomic_uint_fast64_t ab_residual_linear_prunes;
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    atomic_uint_fast64_t abc_residual_checks;
+    atomic_uint_fast64_t abc_residual_prunes;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     atomic_uint_fast64_t completion_checks;
@@ -807,8 +1001,16 @@ static bool install_sigint_handler(void)
 
 static const char *traversal_description(void)
 {
-#if C_MITM_ACTIVE
+#if C_MITM_ACTIVE && AB_RESIDUAL_COLUMN_ORDER_ACTIVE
+    return "fail-first A; place/ABR-ordered B; incremental AB-residual bounds; exact MITM C and D";
+#elif C_MITM_ACTIVE && AB_RESIDUAL_BOUNDS_ACTIVE
+    return "fail-first A/B; incremental AB-residual bounds; exact MITM C and D";
+#elif C_MITM_ACTIVE && AB_RESIDUAL_PERM_ACTIVE
+    return "fail-first A/B; AB-residual fairness; exact MITM C and D";
+#elif C_MITM_ACTIVE
     return "fail-first A/B; exact MITM C and D";
+#elif INCREMENTAL_C_COMPLETION_ACTIVE && AB_RESIDUAL_PERM_ACTIVE
+    return "fail-first A/B; AB-residual fairness; physical C with incremental completion; exact MITM D";
 #elif INCREMENTAL_C_COMPLETION_ACTIVE
     return "fail-first A/B; physical C with incremental completion; exact MITM D";
 #elif EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
@@ -2358,6 +2560,40 @@ static uint64_t choice_contribution(const struct search *search,
         search, candidate, ordered_column(search, row, column), place);
 }
 
+static bool planned_column_precedes(const struct search *search,
+                                    unsigned row,
+                                    unsigned selected_column,
+                                    unsigned selected_choices,
+                                    unsigned previous_column,
+                                    unsigned previous_choices)
+{
+#if AB_RESIDUAL_COLUMN_ORDER_ACTIVE
+    if (row == 1U) {
+        uint64_t selected_score =
+            search->abr_bounds.order_score[selected_column];
+        uint64_t previous_score =
+            search->abr_bounds.order_score[previous_column];
+
+#if AB_RESIDUAL_COLUMN_ORDER_PRIMARY
+        if (selected_score != previous_score) {
+            return selected_score > previous_score;
+        }
+#else
+        if (selected_choices != previous_choices) {
+            return selected_choices < previous_choices;
+        }
+        return selected_score > previous_score;
+#endif
+    }
+#else
+    (void)search;
+    (void)row;
+    (void)selected_column;
+    (void)previous_column;
+#endif
+    return selected_choices < previous_choices;
+}
+
 /*
  * Column zero stays fixed to remove equivalent die renamings.  The remaining
  * columns are stably sorted by the number of choices that can still satisfy
@@ -2600,7 +2836,10 @@ static void plan_column_order(struct search *search, unsigned row)
         unsigned position = column;
 
         while (position > (search->template_active ? 0U : 1U) &&
-               feasible_choices[position - 1U] > selected_choices) {
+               planned_column_precedes(
+                   search, row, selected_column, selected_choices,
+                   search->column_order[row][position - 1U],
+                   feasible_choices[position - 1U])) {
             search->column_order[row][position] =
                 search->column_order[row][position - 1U];
             feasible_choices[position] = feasible_choices[position - 1U];
@@ -3072,6 +3311,11 @@ static void publish_worker_stats(struct search *search)
         atomic_store_explicit(&search->published->completed_rows[row],
                               search->completed_rows[row],
                               memory_order_relaxed);
+#if TRACK_TIME
+        atomic_store_explicit(&search->published->row_time_ns[row],
+                              search->row_time_ns[row],
+                              memory_order_relaxed);
+#endif
     }
 #if ROW2_MITM_ACTIVE
     atomic_store_explicit(&search->published->mitm_solves,
@@ -3082,6 +3326,32 @@ static void publish_worker_stats(struct search *search)
                           search->c_mitm_solves, memory_order_relaxed);
     atomic_store_explicit(&search->published->c_mitm_matches,
                           search->c_mitm_matches, memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    atomic_store_explicit(&search->published->ab_residual_checks,
+                          search->ab_residual_checks,
+                          memory_order_relaxed);
+    atomic_store_explicit(&search->published->ab_residual_prunes,
+                          search->ab_residual_prunes,
+                          memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    atomic_store_explicit(&search->published->ab_residual_bound_prunes,
+                          search->ab_residual_bound_prunes,
+                          memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    atomic_store_explicit(&search->published->ab_residual_linear_prunes,
+                          search->ab_residual_linear_prunes,
+                          memory_order_relaxed);
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    atomic_store_explicit(&search->published->abc_residual_checks,
+                          search->abc_residual_checks,
+                          memory_order_relaxed);
+    atomic_store_explicit(&search->published->abc_residual_prunes,
+                          search->abc_residual_prunes,
+                          memory_order_relaxed);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     atomic_store_explicit(&search->published->completion_checks,
@@ -3230,6 +3500,106 @@ static void record_solution(struct search *search, enum solution_kind kind)
     }
 }
 
+#if TRACK_TIME
+static bool read_thread_cpu_time(struct search *search, uint64_t *value)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0 ||
+        now.tv_sec < 0) {
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        search->time_active = false;
+        return false;
+    }
+    *value = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+        (uint64_t)now.tv_nsec;
+    return true;
+}
+
+static bool begin_row_timing(struct search *search, unsigned row)
+{
+    uint64_t now;
+
+    if (search->time_active || row >= DICE ||
+        !read_thread_cpu_time(search, &now)) {
+        if (search->time_active || row >= DICE) {
+            atomic_store_explicit(&search->shared->internal_error, true,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&search->shared->stop, true,
+                                  memory_order_relaxed);
+            search->time_active = false;
+        }
+        return false;
+    }
+    search->timed_row = row;
+    search->time_started_ns = now;
+    search->time_active = true;
+    return true;
+}
+
+static bool switch_row_timing(struct search *search, unsigned row)
+{
+    uint64_t now;
+    uint64_t elapsed;
+
+    if (!search->time_active || search->timed_row >= DICE || row >= DICE ||
+        !read_thread_cpu_time(search, &now) ||
+        now < search->time_started_ns) {
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        search->time_active = false;
+        return false;
+    }
+    elapsed = now - search->time_started_ns;
+    if (UINT64_MAX - search->row_time_ns[search->timed_row] < elapsed) {
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        search->time_active = false;
+        return false;
+    }
+    search->row_time_ns[search->timed_row] += elapsed;
+    search->timed_row = row;
+    search->time_started_ns = now;
+    return true;
+}
+
+static bool end_row_timing(struct search *search)
+{
+    uint64_t now;
+    uint64_t elapsed;
+
+    if (!search->time_active || search->timed_row >= DICE ||
+        !read_thread_cpu_time(search, &now) ||
+        now < search->time_started_ns) {
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        search->time_active = false;
+        return false;
+    }
+    elapsed = now - search->time_started_ns;
+    if (UINT64_MAX - search->row_time_ns[search->timed_row] < elapsed) {
+        atomic_store_explicit(&search->shared->internal_error, true,
+                              memory_order_relaxed);
+        atomic_store_explicit(&search->shared->stop, true,
+                              memory_order_relaxed);
+        search->time_active = false;
+        return false;
+    }
+    search->row_time_ns[search->timed_row] += elapsed;
+    search->time_active = false;
+    return true;
+}
+#endif
+
 static void accept_configuration(struct search *search)
 {
     struct shared_state *shared = search->shared;
@@ -3295,6 +3665,28 @@ static void accept_configuration(struct search *search)
     }
 }
 
+#if TRACK_TIME
+static void timed_accept_configuration(struct search *search,
+                                       unsigned parent_row)
+{
+    if (!switch_row_timing(search, DICE - 1U)) {
+        return;
+    }
+    accept_configuration(search);
+    (void)switch_row_timing(search, parent_row);
+}
+#else
+#define timed_accept_configuration(search, parent_row) \
+    accept_configuration(search)
+#endif
+
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+static inline void add_ab_residual_choice(struct search *search,
+                                          unsigned column,
+                                          unsigned candidate,
+                                          bool add);
+#endif
+
 static void apply_choice(struct search *search, unsigned row,
                          unsigned column, unsigned candidate)
 {
@@ -3358,6 +3750,11 @@ static void apply_choice(struct search *search, unsigned row,
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     add_additive_perm_choice(search, row, column, true);
 #endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    if (row == 1U) {
+        add_ab_residual_choice(search, column, candidate, true);
+    }
+#endif
 }
 
 static void undo_choice(struct search *search, unsigned row,
@@ -3399,6 +3796,11 @@ static void undo_choice(struct search *search, unsigned row,
     }
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     add_additive_perm_choice(search, row, column, false);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    if (row == 1U) {
+        add_ab_residual_choice(search, column, candidate, false);
+    }
 #endif
 
     temporary = search->grid[row][actual_column];
@@ -3825,8 +4227,563 @@ static const uint8_t early_completion_suffix_order
     [EARLY_COMPLETION_DIRECTION_COUNT][3] = {
         {2, 3, 4}, {2, 4, 3}, {3, 2, 4},
         {3, 4, 2}, {4, 2, 3}, {4, 3, 2},
-    };
+};
 #endif
+
+#endif /* CONDITIONED_COMPLETION_BOUNDS_ACTIVE */
+#endif /* ROW2_MITM_ACTIVE */
+
+#if AB_RESIDUAL_PERM_ACTIVE
+/*
+ * Collapse every unbuilt face into one (DICE-2)*SIDES-sided residual die R.
+ * In a fair completion every ABX triple is fair for X in the residual set,
+ * so summing those counts requires ABR itself to be fair.  This condition
+ * depends only on completed A and B and is exact regardless of how R is
+ * eventually partitioned among C, D, and E.
+ */
+static bool compute_ab_residual_tally(const struct search *search,
+                                      uint64_t tally[6])
+{
+    bool built_face[FACE_COUNT] = {false};
+    unsigned residual_prefix[FACE_COUNT + 1U] = {0};
+    const unsigned residual_sides = (DICE - 2U) * SIDES;
+    unsigned column;
+    unsigned face;
+
+    memset(tally, 0, 6U * sizeof(*tally));
+    for (column = 0; column < SIDES; ++column) {
+        built_face[search->grid[0][column]] = true;
+        built_face[search->grid[1][column]] = true;
+    }
+    for (face = 0; face < FACE_COUNT; ++face) {
+        residual_prefix[face + 1U] = residual_prefix[face] +
+            !built_face[face];
+    }
+    if (residual_prefix[FACE_COUNT] != residual_sides) {
+        return false;
+    }
+
+    for (column = 0; column < SIDES; ++column) {
+        unsigned a = search->grid[0][column];
+        unsigned b_column;
+
+        for (b_column = 0; b_column < SIDES; ++b_column) {
+            unsigned b = search->grid[1][b_column];
+            uint64_t below;
+            uint64_t between;
+            uint64_t above;
+
+            if (a < b) {
+                below = residual_prefix[a];
+                between = residual_prefix[b] - residual_prefix[a + 1U];
+                above = residual_sides - residual_prefix[b + 1U];
+                tally[0] += above;   /* A B R */
+                tally[1] += between; /* A R B */
+                tally[2] += below;   /* R A B */
+            } else {
+                below = residual_prefix[b];
+                between = residual_prefix[a] - residual_prefix[b + 1U];
+                above = residual_sides - residual_prefix[a + 1U];
+                tally[3] += above;   /* B A R */
+                tally[4] += between; /* B R A */
+                tally[5] += below;   /* R B A */
+            }
+        }
+    }
+    return true;
+}
+
+static bool ab_residual_permutation_fair(const struct search *search)
+{
+    uint64_t tally[6];
+    const uint64_t outcome_count =
+        (uint64_t)SIDES * SIDES * ((DICE - 2U) * SIDES);
+    uint64_t goal;
+    unsigned coordinate;
+
+    if (outcome_count % 6U != 0U ||
+        !compute_ab_residual_tally(search, tally)) {
+        return false;
+    }
+    goal = outcome_count / 6U;
+    for (coordinate = 0; coordinate < 6U; ++coordinate) {
+        if (tally[coordinate] != goal) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+/* Swap only the face ownership needed to evaluate a hypothetical B row. */
+static void swap_ab_residual_candidate(struct search *search,
+                                       unsigned column,
+                                       unsigned candidate)
+{
+    unsigned actual_column = ordered_column(search, 1U, column);
+    unsigned temporary = search->grid[1][actual_column];
+
+    search->grid[1][actual_column] = search->grid[candidate][actual_column];
+    search->grid[candidate][actual_column] = temporary;
+#if FULL_MIRROR
+    {
+        unsigned mirror_column = SIDES - actual_column - 1U;
+
+        temporary = search->grid[1][mirror_column];
+        search->grid[1][mirror_column] =
+            search->grid[candidate][mirror_column];
+        search->grid[candidate][mirror_column] = temporary;
+    }
+#elif MIRROR_COLUMNS > 0
+    if (column_has_mirror(actual_column)) {
+        unsigned mirror_column = SIDES - actual_column - 1U;
+
+        temporary = search->grid[1][mirror_column];
+        search->grid[1][mirror_column] =
+            search->grid[candidate][mirror_column];
+        search->grid[candidate][mirror_column] = temporary;
+    }
+#endif
+}
+
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+#if AB_RESIDUAL_LINEAR_FULL_PAIRS
+static const uint8_t ab_residual_direction_first[ABR_DIRECTION_COUNT] = {
+    0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 3, 3, 4
+};
+static const uint8_t ab_residual_direction_second[ABR_DIRECTION_COUNT] = {
+    1, 2, 3, 4, 5, 2, 3, 4, 5, 3, 4, 5, 4, 5, 5
+};
+#else
+static const uint8_t ab_residual_direction_first[ABR_DIRECTION_COUNT] = {
+    0, 1, 2, 3, 4
+};
+static const uint8_t ab_residual_direction_second[ABR_DIRECTION_COUNT] = {
+    5, 5, 5, 5, 5
+};
+#endif
+
+static inline int64_t ab_residual_candidate_delta(
+    const struct ab_residual_bounds *bounds,
+    unsigned column, unsigned candidate, unsigned coordinate)
+{
+    int64_t value = 0;
+    unsigned tracked;
+
+    if (coordinate < ABR_BOUND_COORDINATES) {
+        return bounds->delta[column][candidate][coordinate];
+    }
+    for (tracked = 0; tracked < ABR_BOUND_COORDINATES; ++tracked) {
+        value -= bounds->delta[column][candidate][tracked];
+    }
+    return value;
+}
+
+static inline int64_t ab_residual_current_coordinate(
+    const struct ab_residual_bounds *bounds, unsigned coordinate)
+{
+    int64_t value = bounds->total;
+    unsigned tracked;
+
+    if (coordinate < ABR_BOUND_COORDINATES) {
+        return bounds->tally[coordinate];
+    }
+    for (tracked = 0; tracked < ABR_BOUND_COORDINATES; ++tracked) {
+        value -= bounds->tally[tracked];
+    }
+    return value;
+}
+#endif
+
+/*
+ * ABR looks quadratic because each selected B face is removed from R.  In a
+ * column-grouped row, however, B has exactly one face in every physical
+ * column.  Two B faces in different columns have a fixed order; if an A face
+ * shares either endpoint column, its comparison depends only on that one
+ * endpoint's B choice.  Every apparent B-B term therefore separates into a
+ * constant plus independent per-column terms.  Single-column differences
+ * from an arbitrary baseline are consequently exact additive contributions.
+ */
+static bool initialize_ab_residual_bounds(struct search *search)
+{
+    struct ab_residual_bounds *bounds = &search->abr_bounds;
+    unsigned candidate_mask[SEARCH_COLUMNS];
+    unsigned baseline_candidate[SEARCH_COLUMNS];
+    uint64_t baseline[6];
+    const uint64_t outcome_count =
+        (uint64_t)SIDES * SIDES * ((DICE - 2U) * SIDES);
+    unsigned column;
+    unsigned coordinate;
+
+    if (outcome_count % 6U != 0U || outcome_count > INT64_MAX) {
+        return false;
+    }
+    memset(bounds, 0, sizeof(*bounds));
+    bounds->goal = (int64_t)(outcome_count / 6U);
+    bounds->total = (int64_t)outcome_count;
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = ordered_column(search, 1U, column);
+        unsigned mask = available_candidate_mask(
+            search, 1U, actual_column,
+            !search->template_active && column == 0U);
+
+        if (mask == 0U) {
+            return false;
+        }
+        candidate_mask[column] = mask;
+        baseline_candidate[column] = (unsigned)__builtin_ctz(mask);
+        swap_ab_residual_candidate(
+            search, column, baseline_candidate[column]);
+    }
+    if (!compute_ab_residual_tally(search, baseline)) {
+        column = SEARCH_COLUMNS;
+        while (column-- > 0U) {
+            swap_ab_residual_candidate(
+                search, column, baseline_candidate[column]);
+        }
+        return false;
+    }
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned mask = candidate_mask[column];
+
+        swap_ab_residual_candidate(
+            search, column, baseline_candidate[column]);
+        while (mask != 0U) {
+            uint64_t variant[6];
+            unsigned candidate = (unsigned)__builtin_ctz(mask);
+
+            mask &= mask - 1U;
+            swap_ab_residual_candidate(search, column, candidate);
+            if (!compute_ab_residual_tally(search, variant)) {
+                swap_ab_residual_candidate(search, column, candidate);
+                swap_ab_residual_candidate(
+                    search, column, baseline_candidate[column]);
+                column = SEARCH_COLUMNS;
+                while (column-- > 0U) {
+                    swap_ab_residual_candidate(
+                        search, column, baseline_candidate[column]);
+                }
+                return false;
+            }
+            for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES;
+                 ++coordinate) {
+                bounds->delta[column][candidate][coordinate] =
+                    (int64_t)variant[coordinate] -
+                    (int64_t)baseline[coordinate];
+            }
+            swap_ab_residual_candidate(search, column, candidate);
+        }
+        swap_ab_residual_candidate(
+            search, column, baseline_candidate[column]);
+    }
+
+    column = SEARCH_COLUMNS;
+    while (column-- > 0U) {
+        swap_ab_residual_candidate(
+            search, column, baseline_candidate[column]);
+    }
+    for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES;
+         ++coordinate) {
+        bounds->tally[coordinate] = (int64_t)baseline[coordinate];
+    }
+#if AB_RESIDUAL_COLUMN_ORDER_ACTIVE
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned actual_column = ordered_column(search, 1U, column);
+        uint64_t score = 0;
+
+        for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES;
+             ++coordinate) {
+            int64_t minimum = INT64_MAX;
+            int64_t maximum = INT64_MIN;
+            unsigned choices = candidate_mask[column];
+
+            while (choices != 0U) {
+                unsigned candidate = (unsigned)__builtin_ctz(choices);
+                int64_t value =
+                    bounds->delta[column][candidate][coordinate];
+
+                choices &= choices - 1U;
+                if (value < minimum) {
+                    minimum = value;
+                }
+                if (value > maximum) {
+                    maximum = value;
+                }
+            }
+            score += (uint64_t)(maximum - minimum);
+        }
+        bounds->order_score[actual_column] = score;
+    }
+#endif
+    column = SEARCH_COLUMNS;
+    while (column-- > 0U) {
+        unsigned mask = candidate_mask[column];
+
+        for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES;
+             ++coordinate) {
+            int64_t minimum = INT64_MAX;
+            int64_t maximum = INT64_MIN;
+            unsigned choices = mask;
+
+            while (choices != 0U) {
+                unsigned candidate = (unsigned)__builtin_ctz(choices);
+                int64_t value =
+                    bounds->delta[column][candidate][coordinate];
+
+                choices &= choices - 1U;
+                if (value < minimum) {
+                    minimum = value;
+                }
+                if (value > maximum) {
+                    maximum = value;
+                }
+            }
+            bounds->minimum_left[column][coordinate] = minimum +
+                bounds->minimum_left[column + 1U][coordinate];
+            bounds->maximum_left[column][coordinate] = maximum +
+                bounds->maximum_left[column + 1U][coordinate];
+        }
+    }
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    column = SEARCH_COLUMNS;
+    while (column-- > 0U) {
+        unsigned direction;
+
+        for (direction = 0; direction < ABR_DIRECTION_COUNT; ++direction) {
+            int64_t minimum = INT64_MAX;
+            int64_t maximum = INT64_MIN;
+            unsigned choices = candidate_mask[column];
+
+            while (choices != 0U) {
+                unsigned candidate = (unsigned)__builtin_ctz(choices);
+                int64_t value;
+
+                choices &= choices - 1U;
+                value = ab_residual_candidate_delta(
+                    bounds, column, candidate,
+                    ab_residual_direction_first[direction]) -
+                    ab_residual_candidate_delta(
+                        bounds, column, candidate,
+                        ab_residual_direction_second[direction]);
+                if (value < minimum) {
+                    minimum = value;
+                }
+                if (value > maximum) {
+                    maximum = value;
+                }
+            }
+            bounds->direction_minimum_left[column][direction] =
+                minimum + bounds->direction_minimum_left
+                    [column + 1U][direction];
+            bounds->direction_maximum_left[column][direction] =
+                maximum + bounds->direction_maximum_left
+                    [column + 1U][direction];
+        }
+    }
+#endif
+    return true;
+}
+
+static inline void add_ab_residual_choice(struct search *search,
+                                          unsigned column,
+                                          unsigned candidate,
+                                          bool add)
+{
+    struct ab_residual_bounds *bounds = &search->abr_bounds;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES; ++coordinate) {
+        int64_t value = bounds->delta[column][candidate][coordinate];
+
+        bounds->tally[coordinate] += add ? value : -value;
+    }
+}
+
+static bool ab_residual_bounds_allow_goal(const struct search *search,
+                                          unsigned column)
+{
+    const struct ab_residual_bounds *bounds = &search->abr_bounds;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < ABR_BOUND_COORDINATES; ++coordinate) {
+        int64_t needed = bounds->goal - bounds->tally[coordinate];
+
+        if (needed < bounds->minimum_left[column][coordinate] ||
+            needed > bounds->maximum_left[column][coordinate]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+static __attribute__((noinline)) bool ab_residual_direction_bounds_allow_goal(
+    const struct search *search, unsigned column)
+{
+    const struct ab_residual_bounds *bounds = &search->abr_bounds;
+    int64_t value[ABR_PERMUTATION_COORDINATES];
+    int64_t current[ABR_DIRECTION_STORAGE] = {0};
+    unsigned invalid = 0;
+    unsigned direction = 0;
+
+    /* Coordinate bounds already require the exact terminal vector. */
+    if (column == SEARCH_COLUMNS) {
+        return true;
+    }
+#if AB_RESIDUAL_LINEAR_BOUND_START != 0
+    if (column < AB_RESIDUAL_LINEAR_BOUND_START) {
+        return true;
+    }
+#endif
+#if AB_RESIDUAL_LINEAR_BOUND_STRIDE != 1
+    if (column % AB_RESIDUAL_LINEAR_BOUND_STRIDE != 0U) {
+        return true;
+    }
+#endif
+    for (direction = 0; direction < ABR_PERMUTATION_COORDINATES;
+         ++direction) {
+        value[direction] =
+            ab_residual_current_coordinate(bounds, direction);
+    }
+    for (direction = 0; direction < ABR_DIRECTION_COUNT; ++direction) {
+        current[direction] =
+            value[ab_residual_direction_first[direction]] -
+            value[ab_residual_direction_second[direction]];
+    }
+    for (direction = 0; direction < ABR_DIRECTION_STORAGE; ++direction) {
+        invalid |= current[direction] +
+                bounds->direction_minimum_left[column][direction] > 0;
+        invalid |= current[direction] +
+                bounds->direction_maximum_left[column][direction] < 0;
+    }
+    return invalid == 0U;
+}
+#endif
+#endif
+#endif
+
+#if ABC_RESIDUAL_PERM_ACTIVE
+static unsigned rank_four_permutation(const unsigned word[4])
+{
+    static const unsigned factorial[4] = {6U, 2U, 1U, 1U};
+    unsigned rank = 0;
+    unsigned position;
+
+    for (position = 0; position < 4U; ++position) {
+        unsigned later;
+        unsigned smaller = 0;
+
+        for (later = position + 1U; later < 4U; ++later) {
+            smaller += word[later] < word[position];
+        }
+        rank += smaller * factorial[position];
+    }
+    return rank;
+}
+
+/*
+ * After A, B, and C are built, collapse the unbuilt D/E faces into a
+ * 2*SIDES-sided residual die R.  Fair ABCD and ABCE subsets make each ABCR
+ * ordering the sum of two equal four-die ordering counts.  Thus all 24 ABCR
+ * tallies must equal SIDES^3*(2*SIDES)/24 before any D/E split can work.
+ */
+static bool abc_residual_permutation_fair(const struct search *search)
+{
+    bool built_face[FACE_COUNT] = {false};
+    unsigned residual_prefix[FACE_COUNT + 1U] = {0};
+    uint64_t tally[24] = {0};
+    const unsigned residual_sides = (DICE - 3U) * SIDES;
+    const uint64_t outcome_count =
+        (uint64_t)SIDES * SIDES * SIDES * residual_sides;
+    uint64_t goal;
+    unsigned column;
+    unsigned face;
+
+    if (outcome_count % 24U != 0U) {
+        return false;
+    }
+    goal = outcome_count / 24U;
+    for (column = 0; column < SIDES; ++column) {
+        built_face[search->grid[0][column]] = true;
+        built_face[search->grid[1][column]] = true;
+        built_face[search->grid[2][column]] = true;
+    }
+    for (face = 0; face < FACE_COUNT; ++face) {
+        residual_prefix[face + 1U] = residual_prefix[face] +
+            !built_face[face];
+    }
+    if (residual_prefix[FACE_COUNT] != residual_sides) {
+        return false;
+    }
+
+    for (column = 0; column < SIDES; ++column) {
+        unsigned b_column;
+
+        for (b_column = 0; b_column < SIDES; ++b_column) {
+            unsigned c_column;
+
+            for (c_column = 0; c_column < SIDES; ++c_column) {
+                unsigned value[3] = {
+                    search->grid[0][column],
+                    search->grid[1][b_column],
+                    search->grid[2][c_column],
+                };
+                unsigned owner[3] = {0U, 1U, 2U};
+                uint64_t residual_count[4];
+                unsigned left;
+                unsigned gap;
+
+                for (left = 0; left + 1U < 3U; ++left) {
+                    unsigned right;
+
+                    for (right = left + 1U; right < 3U; ++right) {
+                        if (value[right] < value[left]) {
+                            unsigned temporary = value[left];
+
+                            value[left] = value[right];
+                            value[right] = temporary;
+                            temporary = owner[left];
+                            owner[left] = owner[right];
+                            owner[right] = temporary;
+                        }
+                    }
+                }
+                residual_count[0] = residual_prefix[value[0]];
+                residual_count[1] = residual_prefix[value[1]] -
+                    residual_prefix[value[0] + 1U];
+                residual_count[2] = residual_prefix[value[2]] -
+                    residual_prefix[value[1] + 1U];
+                residual_count[3] = residual_sides -
+                    residual_prefix[value[2] + 1U];
+
+                for (gap = 0; gap < 4U; ++gap) {
+                    unsigned word[4];
+                    unsigned built = 0;
+                    unsigned position;
+
+                    for (position = 0; position < 4U; ++position) {
+                        word[position] = position == gap ? 3U :
+                            owner[built++];
+                    }
+                    tally[rank_four_permutation(word)] +=
+                        residual_count[gap];
+                }
+            }
+        }
+    }
+    for (face = 0; face < 24U; ++face) {
+        if (tally[face] != goal) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+
+#if ROW2_MITM_ACTIVE
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 
@@ -5020,7 +5977,7 @@ static void solve_row2_meet_in_middle(struct search *search, unsigned row)
                         }
                         if (completed_row_is_fair(search, row)) {
                             ++search->completed_rows[row];
-                            accept_configuration(search);
+                            timed_accept_configuration(search, row);
                         }
                         column = SEARCH_COLUMNS;
                         while (column-- > 0) {
@@ -5493,8 +6450,26 @@ static void solve_c_meet_in_middle(struct search *search, unsigned row)
                                 goto internal_error;
                             }
                             ++search->c_mitm_matches;
-                            ++search->completed_rows[row];
-                            search_row(search, row + 1U, 0);
+#if ABC_RESIDUAL_PERM_ACTIVE
+                            ++search->abc_residual_checks;
+                            if (!abc_residual_permutation_fair(search)) {
+                                ++search->abc_residual_prunes;
+                            } else
+#endif
+                            {
+                                ++search->completed_rows[row];
+#if TRACK_TIME
+                                if (!switch_row_timing(search, row + 1U)) {
+                                    return;
+                                }
+#endif
+                                search_row(search, row + 1U, 0);
+#if TRACK_TIME
+                                if (!switch_row_timing(search, row)) {
+                                    return;
+                                }
+#endif
+                            }
                             column = SEARCH_COLUMNS;
                             while (column-- > 0) {
                                 undo_choice(
@@ -5782,7 +6757,17 @@ static void solve_row1_meet_in_middle(struct search *search, unsigned row)
                         }
                         if (completed_row_is_fair(search, row)) {
                             ++search->completed_rows[row];
+#if TRACK_TIME
+                            if (!switch_row_timing(search, row + 1U)) {
+                                return;
+                            }
+#endif
                             search_row(search, row + 1U, 0);
+#if TRACK_TIME
+                            if (!switch_row_timing(search, row)) {
+                                return;
+                            }
+#endif
                         }
                         column = SEARCH_COLUMNS;
                         while (column-- > 0) {
@@ -5864,9 +6849,31 @@ static void search_row(struct search *search, unsigned row, unsigned column)
             } else
 #endif
             {
+#if AB_RESIDUAL_COLUMN_ORDER_ACTIVE
+            if (row == 1U) {
+                reset_column_order(search, row);
+                if (!initialize_ab_residual_bounds(search)) {
+                    atomic_store_explicit(
+                        &search->shared->internal_error, true,
+                        memory_order_relaxed);
+                    atomic_store_explicit(&search->shared->stop, true,
+                                          memory_order_relaxed);
+                    return;
+                }
+            }
+#endif
             plan_column_order(search, row);
             }
             build_bounds(search, row);
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+            if (row == 1U && !initialize_ab_residual_bounds(search)) {
+                atomic_store_explicit(&search->shared->internal_error, true,
+                                      memory_order_relaxed);
+                atomic_store_explicit(&search->shared->stop, true,
+                                      memory_order_relaxed);
+                return;
+            }
+#endif
         }
     }
 #if ROW1_MITM_ACTIVE
@@ -5911,6 +6918,19 @@ static void search_row(struct search *search, unsigned row, unsigned column)
         ++search->pair_bound_prunes;
         return;
     }
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    if (row == 1U && !ab_residual_bounds_allow_goal(search, column)) {
+        ++search->ab_residual_bound_prunes;
+        return;
+    }
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    if (row == 1U &&
+        !ab_residual_direction_bounds_allow_goal(search, column)) {
+        ++search->ab_residual_linear_prunes;
+        return;
+    }
+#endif
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
     if (column == 0 && row >= 2U) {
         build_additive_perm_bounds(search, row);
@@ -5969,6 +6989,24 @@ static void search_row(struct search *search, unsigned row, unsigned column)
 #endif
             return;
         }
+#if AB_RESIDUAL_PERM_ACTIVE
+        if (row == 1U) {
+            ++search->ab_residual_checks;
+            if (!ab_residual_permutation_fair(search)) {
+                ++search->ab_residual_prunes;
+                return;
+            }
+        }
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+        if (row == 2U) {
+            ++search->abc_residual_checks;
+            if (!abc_residual_permutation_fair(search)) {
+                ++search->abc_residual_prunes;
+                return;
+            }
+        }
+#endif
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
         if (row == 1U && !search->template_active &&
             !early_conditioned_completion_possible(search)) {
@@ -5977,7 +7015,17 @@ static void search_row(struct search *search, unsigned row, unsigned column)
 #endif
         ++search->completed_rows[row];
         if (row + 1U < DICE - 1U) {
+#if TRACK_TIME
+            if (!switch_row_timing(search, row + 1U)) {
+                return;
+            }
+#endif
             search_row(search, row + 1U, 0);
+#if TRACK_TIME
+            if (!switch_row_timing(search, row)) {
+                return;
+            }
+#endif
         } else {
             /*
              * The last die is forced rather than visited by search_row().
@@ -5985,7 +7033,7 @@ static void search_row(struct search *search, unsigned row, unsigned column)
              * full place fairness is verified, expected-rank balance forces
              * every remaining matchup with the last die to balance as well.
              */
-            accept_configuration(search);
+            timed_accept_configuration(search, row);
         }
         return;
     }
@@ -6070,6 +7118,28 @@ static void prepare_template_search(struct search *search,
             *start_row = row;
             return;
         }
+#if AB_RESIDUAL_PERM_ACTIVE
+        if (row == 1U) {
+            ++search->ab_residual_checks;
+            if (!ab_residual_permutation_fair(search)) {
+                ++search->ab_residual_prunes;
+                search->template_possible = false;
+                *start_row = row;
+                return;
+            }
+        }
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+        if (row == 2U) {
+            ++search->abc_residual_checks;
+            if (!abc_residual_permutation_fair(search)) {
+                ++search->abc_residual_prunes;
+                search->template_possible = false;
+                *start_row = row;
+                return;
+            }
+        }
+#endif
         ++row;
     }
     *start_row = row;
@@ -6189,12 +7259,29 @@ static bool initialize_search(struct search *search,
 struct totals {
     uint64_t nodes;
     uint64_t completed_rows[DICE];
+#if TRACK_TIME
+    uint64_t row_time_ns[DICE];
+#endif
 #if ROW2_MITM_ACTIVE
     uint64_t mitm_solves;
 #endif
 #if C_MITM_ACTIVE
     uint64_t c_mitm_solves;
     uint64_t c_mitm_matches;
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    uint64_t ab_residual_checks;
+    uint64_t ab_residual_prunes;
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    uint64_t ab_residual_bound_prunes;
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    uint64_t ab_residual_linear_prunes;
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    uint64_t abc_residual_checks;
+    uint64_t abc_residual_prunes;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     uint64_t completion_checks;
@@ -6231,6 +7318,9 @@ struct totals {
 #define SI_COUNT_TEXT_SIZE 24
 #define ROW_PROGRESS_TEXT_SIZE \
     (DICE * (SI_COUNT_TEXT_SIZE + 3U) + 1U)
+#if TRACK_TIME
+#define TIME_PROGRESS_TEXT_SIZE (DICE * 16U + 1U)
+#endif
 
 /* Keep exact small counts, then use four significant digits and an SI suffix. */
 static void format_si_count(char text[SI_COUNT_TEXT_SIZE], uint64_t value)
@@ -6313,6 +7403,37 @@ static void format_row_progress(
     }
 }
 
+#if TRACK_TIME
+static void format_row_time(
+    char text[TIME_PROGRESS_TEXT_SIZE],
+    const uint64_t row_time_ns[DICE],
+    const unsigned logical_die[DICE])
+{
+    long double total = 0;
+    size_t used = 0;
+    unsigned row;
+
+    for (row = 0; row < DICE; ++row) {
+        total += (long double)row_time_ns[row];
+    }
+    for (row = 0; row < DICE; ++row) {
+        long double percentage = total == 0 ? 0 :
+            100.0L * (long double)row_time_ns[row] / total;
+        int written = snprintf(
+            text + used, TIME_PROGRESS_TEXT_SIZE - used,
+            "%s%c:%.1Lf%%", row == 0U ? "" : ",",
+            'A' + logical_die[row], percentage);
+
+        if (written < 0 || (size_t)written >=
+                TIME_PROGRESS_TEXT_SIZE - used) {
+            text[TIME_PROGRESS_TEXT_SIZE - 1U] = '\0';
+            return;
+        }
+        used += (size_t)written;
+    }
+}
+#endif
+
 static struct totals collect_totals(const struct worker *workers,
                                     unsigned thread_count)
 {
@@ -6328,6 +7449,11 @@ static struct totals collect_totals(const struct worker *workers,
             totals.completed_rows[row] += atomic_load_explicit(
                 &workers[i].stats.completed_rows[row],
                 memory_order_relaxed);
+#if TRACK_TIME
+            totals.row_time_ns[row] += atomic_load_explicit(
+                &workers[i].stats.row_time_ns[row],
+                memory_order_relaxed);
+#endif
         }
 #if ROW2_MITM_ACTIVE
         totals.mitm_solves += atomic_load_explicit(
@@ -6338,6 +7464,28 @@ static struct totals collect_totals(const struct worker *workers,
             &workers[i].stats.c_mitm_solves, memory_order_relaxed);
         totals.c_mitm_matches += atomic_load_explicit(
             &workers[i].stats.c_mitm_matches, memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+        totals.ab_residual_checks += atomic_load_explicit(
+            &workers[i].stats.ab_residual_checks, memory_order_relaxed);
+        totals.ab_residual_prunes += atomic_load_explicit(
+            &workers[i].stats.ab_residual_prunes, memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+        totals.ab_residual_bound_prunes += atomic_load_explicit(
+            &workers[i].stats.ab_residual_bound_prunes,
+            memory_order_relaxed);
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+        totals.ab_residual_linear_prunes += atomic_load_explicit(
+            &workers[i].stats.ab_residual_linear_prunes,
+            memory_order_relaxed);
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+        totals.abc_residual_checks += atomic_load_explicit(
+            &workers[i].stats.abc_residual_checks, memory_order_relaxed);
+        totals.abc_residual_prunes += atomic_load_explicit(
+            &workers[i].stats.abc_residual_prunes, memory_order_relaxed);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
         totals.completion_checks += atomic_load_explicit(
@@ -6408,8 +7556,18 @@ static void run_prefix(struct worker *worker, uint64_t prefix)
     unsigned column;
     unsigned row = worker->shared->start_row;
 
+#if TRACK_TIME
+    if (!begin_row_timing(search, row < DICE ? row : DICE - 1U)) {
+        return;
+    }
+#endif
     if (row + 1U >= DICE) {
         accept_configuration(search);
+#if TRACK_TIME
+        if (search->time_active) {
+            (void)end_row_timing(search);
+        }
+#endif
         return;
     }
     for (column = 0; column < worker->shared->prefix_columns; ++column) {
@@ -6434,6 +7592,11 @@ static void run_prefix(struct worker *worker, uint64_t prefix)
     while (column-- > 0) {
         undo_choice(search, row, column, selected[column]);
     }
+#if TRACK_TIME
+    if (search->time_active) {
+        (void)end_row_timing(search);
+    }
+#endif
 }
 
 static bool run_job(struct worker *worker, uint64_t job)
@@ -6627,12 +7790,29 @@ static void print_progress(const struct shared_state *shared,
         : shared->mirror_symmetric_total;
     char nodes[SI_COUNT_TEXT_SIZE];
     char row_progress[ROW_PROGRESS_TEXT_SIZE];
+#if TRACK_TIME
+    char row_time[TIME_PROGRESS_TEXT_SIZE];
+#endif
 #if ROW2_MITM_ACTIVE
     char mitm_solves[SI_COUNT_TEXT_SIZE];
 #endif
 #if C_MITM_ACTIVE
     char c_mitm_solves[SI_COUNT_TEXT_SIZE];
     char c_mitm_matches[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    char ab_residual_checks[SI_COUNT_TEXT_SIZE];
+    char ab_residual_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    char ab_residual_bound_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    char ab_residual_linear_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    char abc_residual_checks[SI_COUNT_TEXT_SIZE];
+    char abc_residual_prunes[SI_COUNT_TEXT_SIZE];
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     char completion_checks[SI_COUNT_TEXT_SIZE];
@@ -6672,12 +7852,32 @@ static void print_progress(const struct shared_state *shared,
     format_si_count(nodes, totals.nodes);
     format_row_progress(row_progress, totals.completed_rows,
                         workers[0].search.logical_die);
+#if TRACK_TIME
+    format_row_time(row_time, totals.row_time_ns,
+                    workers[0].search.logical_die);
+#endif
 #if ROW2_MITM_ACTIVE
     format_si_count(mitm_solves, totals.mitm_solves);
 #endif
 #if C_MITM_ACTIVE
     format_si_count(c_mitm_solves, totals.c_mitm_solves);
     format_si_count(c_mitm_matches, totals.c_mitm_matches);
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+    format_si_count(ab_residual_checks, totals.ab_residual_checks);
+    format_si_count(ab_residual_prunes, totals.ab_residual_prunes);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+    format_si_count(ab_residual_bound_prunes,
+                    totals.ab_residual_bound_prunes);
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+    format_si_count(ab_residual_linear_prunes,
+                    totals.ab_residual_linear_prunes);
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+    format_si_count(abc_residual_checks, totals.abc_residual_checks);
+    format_si_count(abc_residual_prunes, totals.abc_residual_prunes);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     format_si_count(completion_checks, totals.completion_checks);
@@ -6721,10 +7921,19 @@ static void print_progress(const struct shared_state *shared,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
             " nodes=%s"
             " rows=%s"
+#if TRACK_TIME
+            " time=%s"
+#endif
             " place-pruned=%s"
             " linear-place-pruned=%s"
 #if !ROW1_MITM_ACTIVE
             " pair-pruned=%s"
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+            " abr-bound-pruned=%s"
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+            " linear-abr-pruned=%s"
+#endif
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             " additive-perm-pruned=%s"
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -6735,6 +7944,9 @@ static void print_progress(const struct shared_state *shared,
             " all-subset-place-pruned=%s"
             " all-subset-place-fair=%s"
 #endif
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+            " ab-residual-checks=%s ab-residual-pruned=%s"
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
@@ -6753,6 +7965,11 @@ static void print_progress(const struct shared_state *shared,
 #endif
             " c-completion-states=%s"
 #endif
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+            " abc-residual-checks=%s abc-residual-pruned=%s"
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             " completion-checks=%s completion-pruned=%s"
 #endif
 #if ROW2_MITM_ACTIVE
@@ -6761,10 +7978,19 @@ static void print_progress(const struct shared_state *shared,
             " permutation-fair=%s mirror-symmetric=%s\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
             shared->job_count, nodes, row_progress,
+#if TRACK_TIME
+            row_time,
+#endif
             bound_prunes,
             linear_place_prunes,
 #if !ROW1_MITM_ACTIVE
             pair_bound_prunes,
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+            ab_residual_bound_prunes,
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+            ab_residual_linear_prunes,
+#endif
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
             additive_perm_prunes,
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -6775,6 +8001,9 @@ static void print_progress(const struct shared_state *shared,
             all_subset_place_prunes,
             all_subset_place_fair,
 #endif
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+            ab_residual_checks, ab_residual_prunes,
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
@@ -6793,6 +8022,11 @@ static void print_progress(const struct shared_state *shared,
 #endif
             c_completion_states,
 #endif
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+            abc_residual_checks, abc_residual_prunes,
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             completion_checks, completion_prunes,
 #endif
 #if ROW2_MITM_ACTIVE
@@ -7072,6 +8306,9 @@ int main(int argc, char **argv)
 
             for (row = 0; row < DICE; ++row) {
                 atomic_init(&workers[i].stats.completed_rows[row], 0);
+#if TRACK_TIME
+                atomic_init(&workers[i].stats.row_time_ns[row], 0);
+#endif
             }
         }
 #if ROW2_MITM_ACTIVE
@@ -7080,6 +8317,20 @@ int main(int argc, char **argv)
 #if C_MITM_ACTIVE
         atomic_init(&workers[i].stats.c_mitm_solves, 0);
         atomic_init(&workers[i].stats.c_mitm_matches, 0);
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+        atomic_init(&workers[i].stats.ab_residual_checks, 0);
+        atomic_init(&workers[i].stats.ab_residual_prunes, 0);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+        atomic_init(&workers[i].stats.ab_residual_bound_prunes, 0);
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+        atomic_init(&workers[i].stats.ab_residual_linear_prunes, 0);
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+        atomic_init(&workers[i].stats.abc_residual_checks, 0);
+        atomic_init(&workers[i].stats.abc_residual_prunes, 0);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
         atomic_init(&workers[i].stats.completion_checks, 0);
@@ -7166,6 +8417,9 @@ int main(int argc, char **argv)
                 workers[0].c_mitm.entry_capacity, right_states,
                 workspace_tenths / 10U, workspace_tenths % 10U);
     }
+#endif
+#if TRACK_TIME
+    fputs(", timing=exclusive-thread-cpu", stderr);
 #endif
     if (options.random_order) {
         fprintf(stderr, ", seed=%" PRIu64, options.seed);
@@ -7260,12 +8514,29 @@ int main(int argc, char **argv)
             bool search_failed;
             char nodes[SI_COUNT_TEXT_SIZE];
             char row_progress[ROW_PROGRESS_TEXT_SIZE];
+#if TRACK_TIME
+            char row_time[TIME_PROGRESS_TEXT_SIZE];
+#endif
 #if ROW2_MITM_ACTIVE
             char mitm_solves[SI_COUNT_TEXT_SIZE];
 #endif
 #if C_MITM_ACTIVE
             char c_mitm_solves[SI_COUNT_TEXT_SIZE];
             char c_mitm_matches[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+            char ab_residual_checks[SI_COUNT_TEXT_SIZE];
+            char ab_residual_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+            char ab_residual_bound_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+            char ab_residual_linear_prunes[SI_COUNT_TEXT_SIZE];
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+            char abc_residual_checks[SI_COUNT_TEXT_SIZE];
+            char abc_residual_prunes[SI_COUNT_TEXT_SIZE];
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             char completion_checks[SI_COUNT_TEXT_SIZE];
@@ -7306,12 +8577,36 @@ int main(int argc, char **argv)
             format_si_count(nodes, totals.nodes);
             format_row_progress(row_progress, totals.completed_rows,
                                 workers[0].search.logical_die);
+#if TRACK_TIME
+            format_row_time(row_time, totals.row_time_ns,
+                            workers[0].search.logical_die);
+#endif
 #if ROW2_MITM_ACTIVE
             format_si_count(mitm_solves, totals.mitm_solves);
 #endif
 #if C_MITM_ACTIVE
             format_si_count(c_mitm_solves, totals.c_mitm_solves);
             format_si_count(c_mitm_matches, totals.c_mitm_matches);
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+            format_si_count(ab_residual_checks,
+                            totals.ab_residual_checks);
+            format_si_count(ab_residual_prunes,
+                            totals.ab_residual_prunes);
+#endif
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+            format_si_count(ab_residual_bound_prunes,
+                            totals.ab_residual_bound_prunes);
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+            format_si_count(ab_residual_linear_prunes,
+                            totals.ab_residual_linear_prunes);
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+            format_si_count(abc_residual_checks,
+                            totals.abc_residual_checks);
+            format_si_count(abc_residual_prunes,
+                            totals.abc_residual_prunes);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             format_si_count(completion_checks, totals.completion_checks);
@@ -7419,10 +8714,19 @@ int main(int argc, char **argv)
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
                     ", nodes=%s (%s/s)"
                     ", rows=%s"
+#if TRACK_TIME
+                    ", time=%s"
+#endif
                     ", place-pruned=%s"
                     ", linear-place-prunes=%s"
 #if !ROW1_MITM_ACTIVE
                     ", pair-pruned=%s"
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+                    ", abr-bound-pruned=%s"
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+                    ", linear-abr-pruned=%s"
+#endif
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     ", additive-perm-prunes=%s"
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -7433,6 +8737,9 @@ int main(int argc, char **argv)
                     ", all-subset-place-prunes=%s"
                     ", all-subset-place-fair=%s"
 #endif
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+                    ", ab-residual-checks=%s, ab-residual-pruned=%s"
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
@@ -7453,6 +8760,11 @@ int main(int argc, char **argv)
 #endif
                     ", c-completion-states=%s"
 #endif
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+                    ", abc-residual-checks=%s, abc-residual-pruned=%s"
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
                     ", completion-checks=%s, completion-pruned=%s"
 #endif
 #if ROW2_MITM_ACTIVE
@@ -7466,9 +8778,18 @@ int main(int argc, char **argv)
                     shared.thread_count,
                     jobs_done,
                     shared.job_count, nodes, node_rate, row_progress,
+#if TRACK_TIME
+                    row_time,
+#endif
                     bound_prunes, linear_place_prunes,
 #if !ROW1_MITM_ACTIVE
                     pair_bound_prunes,
+#if AB_RESIDUAL_BOUNDS_ACTIVE
+                    ab_residual_bound_prunes,
+#endif
+#if AB_RESIDUAL_LINEAR_BOUNDS_ACTIVE
+                    ab_residual_linear_prunes,
+#endif
 #if ADDITIVE_PERM_BOUNDS_ACTIVE
                     additive_perm_prunes,
 #if ADDITIVE_PERM_LINEAR_ACTIVE
@@ -7479,6 +8800,9 @@ int main(int argc, char **argv)
                     all_subset_place_prunes,
                     all_subset_place_fair,
 #endif
+#endif
+#if AB_RESIDUAL_PERM_ACTIVE
+                    ab_residual_checks, ab_residual_prunes,
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
@@ -7497,6 +8821,11 @@ int main(int argc, char **argv)
 #endif
                     c_completion_states,
 #endif
+#endif
+#if ABC_RESIDUAL_PERM_ACTIVE
+                    abc_residual_checks, abc_residual_prunes,
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
                     completion_checks, completion_prunes,
 #endif
 #if ROW2_MITM_ACTIVE

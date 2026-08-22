@@ -22,11 +22,29 @@ EARLY_COMPLETION ?= 1
 C_COMPLETION ?= 0
 # Replace recursive C construction with an exact ternary half-row join.
 C_MITM ?= 0
+# Require completed AB to be fair against the collapsed C/D/E residual die.
+AB_RESIDUAL ?= 1
+# Apply exact additive ABR suffix bounds while B is under construction.
+ABR_BOUNDS ?= $(AB_RESIDUAL)
+# Use ABR contribution spans to break place-planner ties for B columns.
+ABR_ORDER ?= $(ABR_BOUNDS)
+ABR_ORDER_PRIMARY ?= 0
+# Apply coupled linear bounds to the six ABR permutation coordinates.
+ABR_LINEAR ?= 0
+ABR_LINEAR_STRIDE ?= 3
+# Leave empty to start halfway through B; override with a search-column depth.
+ABR_LINEAR_START ?=
+# Check a five-direction basis by default; all 15 pairs remain experimental.
+ABR_LINEAR_FULL ?= 0
+# Require completed ABC to be fair against the collapsed D/E residual die.
+ABC_RESIDUAL ?= 1
+# Attribute exclusive per-row thread CPU time; disabled for zero hot-loop cost.
+TRACK_TIME ?= 0
 # Direction one is scalar and cheap; directions three through six introduce
 # successively more expensive sparse nonlinear frontiers.
 C_COMPLETION_DIRECTIONS ?= 1
-# Add the second scalar identity and their X+Y/X-Y support bounds.  This is
-# ignored unless C_COMPLETION=1.
+# Add the second scalar identity and their X+Y/X-Y support bounds.  This
+# requires C_COMPLETION=1; meaningless combinations are compile-time errors.
 C_COMPLETION_COUPLED ?= 0
 LINEAR_STRIDE ?= 2
 PERM_LINEAR_STRIDE ?= 3
@@ -45,6 +63,16 @@ CPPFLAGS += -DDICE=$(DICE) -DSIDES=$(SIDES) -DMIRROR=$(MIRROR) \
 	-DEARLY_CONDITIONED_COMPLETION_BOUNDS=$(EARLY_COMPLETION) \
 	-DINCREMENTAL_C_COMPLETION=$(C_COMPLETION) \
 	-DC_MITM=$(C_MITM) \
+	-DAB_RESIDUAL_PERM=$(AB_RESIDUAL) \
+	-DAB_RESIDUAL_BOUNDS=$(ABR_BOUNDS) \
+	-DAB_RESIDUAL_COLUMN_ORDER=$(ABR_ORDER) \
+	-DAB_RESIDUAL_COLUMN_ORDER_PRIMARY=$(ABR_ORDER_PRIMARY) \
+	-DAB_RESIDUAL_LINEAR_BOUNDS=$(ABR_LINEAR) \
+	-DAB_RESIDUAL_LINEAR_BOUND_STRIDE=$(ABR_LINEAR_STRIDE) \
+	$(if $(strip $(ABR_LINEAR_START)),-DAB_RESIDUAL_LINEAR_BOUND_START=$(ABR_LINEAR_START)) \
+	-DAB_RESIDUAL_LINEAR_FULL_PAIRS=$(ABR_LINEAR_FULL) \
+	-DABC_RESIDUAL_PERM=$(ABC_RESIDUAL) \
+	-DTRACK_TIME=$(TRACK_TIME) \
 	-DINCREMENTAL_C_COMPLETION_DIRECTIONS=$(C_COMPLETION_DIRECTIONS) \
 	-DINCREMENTAL_C_COMPLETION_COUPLED=$(C_COMPLETION_COUPLED) \
 	-DLINEAR_BOUND_STRIDE=$(LINEAR_STRIDE) \
@@ -88,7 +116,7 @@ define build_with_pgo
 	trap 'exit 130' HUP INT TERM; \
 	echo "Building instrumented $(1)" \
 		"(DICE=$(DICE), SIDES=$(SIDES), PERM_ONLY=$(PERM_ONLY)," \
-		"ROW_MITM=$(ROW_MITM), C_MITM=$(C_MITM), C_COMPLETION=$(C_COMPLETION)/$(C_COMPLETION_DIRECTIONS)+coupled$(C_COMPLETION_COUPLED)," \
+		"ROW_MITM=$(ROW_MITM), C_MITM=$(C_MITM), AB_RESIDUAL=$(AB_RESIDUAL)/bounds$(ABR_BOUNDS)+order$(ABR_ORDER)/primary$(ABR_ORDER_PRIMARY)+linear$(ABR_LINEAR)/$(ABR_LINEAR_STRIDE)@$(if $(strip $(ABR_LINEAR_START)),$(ABR_LINEAR_START),half)+full$(ABR_LINEAR_FULL), ABC_RESIDUAL=$(ABC_RESIDUAL), TRACK_TIME=$(TRACK_TIME), C_COMPLETION=$(C_COMPLETION)/$(C_COMPLETION_DIRECTIONS)+coupled$(C_COMPLETION_COUPLED)," \
 		"MIRROR_COLUMNS=$(if $(strip $(MIRROR_COLUMNS)),$(MIRROR_COLUMNS),legacy))"; \
 	$(PGO_CC) $(CPPFLAGS) $(3) $(CFLAGS) \
 		-fprofile-generate="$$pgo_dir" -fprofile-update=atomic \
