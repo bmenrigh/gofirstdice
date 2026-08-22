@@ -32,6 +32,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#endif
+
 #ifndef DICE
 #define DICE 4
 #endif
@@ -82,6 +86,10 @@
 
 #ifndef INCREMENTAL_C_COMPLETION_COUPLED
 #define INCREMENTAL_C_COMPLETION_COUPLED 0
+#endif
+
+#ifndef C_MITM
+#define C_MITM 0
 #endif
 
 #ifndef MIRROR_COLUMNS
@@ -155,6 +163,10 @@
 #error "C_COMPLETION_COUPLED must be either zero or one"
 #endif
 
+#if C_MITM != 0 && C_MITM != 1
+#error "C_MITM must be either zero or one"
+#endif
+
 #if ROW2_MITM && \
     ((DICE != 4 && DICE != 5) || !PERM_ONLY || SEARCH_COLUMNS > 30)
 #error "ROW2_MITM requires DICE=4..5 PERM_ONLY=1 and at most 30 independent columns"
@@ -175,6 +187,14 @@
 #error "C_COMPLETION requires DICE=5 PERM_ONLY=1 ROW_MITM=1 COMPLETION_BOUNDS=1"
 #endif
 
+#if C_MITM && (DICE != 5 || !ROW2_MITM || !PERM_ONLY)
+#error "C_MITM requires DICE=5 PERM_ONLY=1 ROW_MITM=1"
+#endif
+
+#if C_MITM && INCREMENTAL_C_COMPLETION
+#error "C_MITM and C_COMPLETION are alternative C-row search strategies"
+#endif
+
 #define ADDITIVE_PERM_BOUNDS_ACTIVE (PERM_ONLY && DICE >= 4)
 #define ADDITIVE_PERM_LINEAR_ACTIVE \
     (ADDITIVE_PERM_BOUNDS_ACTIVE && ADDITIVE_PERM_LINEAR)
@@ -192,6 +212,7 @@
 #define INCREMENTAL_C_COMPLETION_ACTIVE \
     (CONDITIONED_COMPLETION_BOUNDS_ACTIVE && DICE == 5 && \
      INCREMENTAL_C_COMPLETION)
+#define C_MITM_ACTIVE (C_MITM && DICE == 5 && ROW2_MITM_ACTIVE)
 
 #if MIRROR && ((SIDES % 2) != 0)
 #error "Mirrored column-grouped dice require an even SIDES value"
@@ -227,6 +248,14 @@
 #else
 #define ROW1_MITM_VECTOR_WIDTH 4U
 #endif
+#endif
+#if C_MITM_ACTIVE
+#define C_MITM_PERMUTATION_COORDINATES 5U
+#define C_MITM_VECTOR_WIDTH \
+    (C_MITM_PERMUTATION_COORDINATES + DICE - 1U)
+#define C_MITM_FILTER_BUCKETS_PER_WORD 32U
+#define C_MITM_FILTER_FINGERPRINT_SHIFT 32U
+#define C_MITM_PREFETCH_BATCH 512U
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if DICE == 4
@@ -371,6 +400,12 @@ _Static_assert(ROW2_MITM_VECTOR_WIDTH ==
                    MAX_PREFIX_PERMUTATIONS - 1U + DICE - 1U,
                "final-row MITM vector width is inconsistent");
 #endif
+#if C_MITM_ACTIVE
+_Static_assert(C_MITM_VECTOR_WIDTH == 9U,
+               "C-row MITM vector width is inconsistent");
+_Static_assert(SEARCH_COLUMNS >= 1U && SEARCH_COLUMNS - 1U <= 29U,
+               "C-row MITM choices must fit in packed 32-bit words");
+#endif
 #if INCREMENTAL_C_COMPLETION_ACTIVE
 _Static_assert(EARLY_COMPLETION_G_LIMIT <= INT16_MAX,
                "C-completion G state must fit in int16_t");
@@ -471,6 +506,25 @@ struct row1_mitm_entry {
 };
 #endif
 
+#if C_MITM_ACTIVE
+struct c_mitm_entry {
+    uint64_t hash;
+    uint32_t choices;
+    uint32_t next;
+};
+
+_Static_assert(sizeof(struct c_mitm_entry) == 16U,
+               "C MITM entries must remain one 16-byte streaming store");
+
+struct c_mitm_workspace {
+    struct c_mitm_entry *entry;
+    uint32_t *head;
+    uint64_t *filter;
+    uint32_t entry_capacity;
+    uint32_t head_capacity;
+};
+#endif
+
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 struct conditioned_completion_bounds {
     uint8_t positions[COLUMN_PERMUTATION_COUNT][DICE];
@@ -564,6 +618,9 @@ struct search {
 #if INCREMENTAL_C_COMPLETION_ACTIVE
     struct incremental_c_completion c_completion;
 #endif
+#if C_MITM_ACTIVE
+    struct c_mitm_workspace *c_mitm;
+#endif
 #if PACKED_PAIR_WINS
     /* One byte-wide win counter per previous die, packed into a word. */
     uint64_t pair_wins[DICE];
@@ -587,8 +644,14 @@ struct search {
     struct worker_stats *published;
 
     uint64_t nodes;
+    /* Nonfinal rows count transitions; the forced final row counts checks. */
+    uint64_t completed_rows[DICE];
 #if ROW2_MITM_ACTIVE
     uint64_t mitm_solves;
+#endif
+#if C_MITM_ACTIVE
+    uint64_t c_mitm_solves;
+    uint64_t c_mitm_matches;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     uint64_t completion_checks;
@@ -624,8 +687,13 @@ struct search {
 
 struct worker_stats {
     atomic_uint_fast64_t nodes;
+    atomic_uint_fast64_t completed_rows[DICE];
 #if ROW2_MITM_ACTIVE
     atomic_uint_fast64_t mitm_solves;
+#endif
+#if C_MITM_ACTIVE
+    atomic_uint_fast64_t c_mitm_solves;
+    atomic_uint_fast64_t c_mitm_matches;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     atomic_uint_fast64_t completion_checks;
@@ -708,6 +776,9 @@ struct worker {
     unsigned id;
     struct shared_state *shared;
     struct worker_stats stats;
+#if C_MITM_ACTIVE
+    struct c_mitm_workspace c_mitm;
+#endif
     struct search search;
 };
 
@@ -736,7 +807,9 @@ static bool install_sigint_handler(void)
 
 static const char *traversal_description(void)
 {
-#if INCREMENTAL_C_COMPLETION_ACTIVE
+#if C_MITM_ACTIVE
+    return "fail-first A/B; exact MITM C and D";
+#elif INCREMENTAL_C_COMPLETION_ACTIVE
     return "fail-first A/B; physical C with incremental completion; exact MITM D";
 #elif EARLY_CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     return "fail-first; conditioned A/B and final-row bounds; exact MITM final built die";
@@ -2045,6 +2118,11 @@ static void build_additive_perm_bounds(struct search *search, unsigned row)
         return;
     }
 #endif
+#if C_MITM_ACTIVE
+    if (row == 2U && !search->template_active) {
+        return;
+    }
+#endif
     memset(bounds->minimum_left[row][SEARCH_COLUMNS], 0,
            sizeof(bounds->minimum_left[row][SEARCH_COLUMNS]));
     memset(bounds->maximum_left[row][SEARCH_COLUMNS], 0,
@@ -2986,11 +3064,24 @@ static double monotonic_seconds(void)
 
 static void publish_worker_stats(struct search *search)
 {
+    unsigned row;
+
     atomic_store_explicit(&search->published->nodes, search->nodes,
                           memory_order_relaxed);
+    for (row = 0; row < DICE; ++row) {
+        atomic_store_explicit(&search->published->completed_rows[row],
+                              search->completed_rows[row],
+                              memory_order_relaxed);
+    }
 #if ROW2_MITM_ACTIVE
     atomic_store_explicit(&search->published->mitm_solves,
                           search->mitm_solves, memory_order_relaxed);
+#endif
+#if C_MITM_ACTIVE
+    atomic_store_explicit(&search->published->c_mitm_solves,
+                          search->c_mitm_solves, memory_order_relaxed);
+    atomic_store_explicit(&search->published->c_mitm_matches,
+                          search->c_mitm_matches, memory_order_relaxed);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     atomic_store_explicit(&search->published->completion_checks,
@@ -3144,6 +3235,9 @@ static void accept_configuration(struct search *search)
     struct shared_state *shared = search->shared;
     uint64_t limit_claim = 0;
     bool permutation_fair;
+
+    /* The final row is forced once the preceding DICE-1 rows are fixed. */
+    ++search->completed_rows[DICE - 1U];
 
     /* The last die is implied; verify the invariant before reporting it. */
     if (!configuration_is_place_fair(search)) {
@@ -4925,6 +5019,7 @@ static void solve_row2_meet_in_middle(struct search *search, unsigned row)
                                 search, row, column, selected[column]);
                         }
                         if (completed_row_is_fair(search, row)) {
+                            ++search->completed_rows[row];
                             accept_configuration(search);
                         }
                         column = SEARCH_COLUMNS;
@@ -4944,6 +5039,492 @@ static void solve_row2_meet_in_middle(struct search *search, unsigned row)
             previous_gray = right_gray;
         }
     }
+}
+#endif
+
+#if C_MITM_ACTIVE
+static void search_row(struct search *search, unsigned row, unsigned column);
+
+static uint64_t c_mitm_vector_hash(
+    const int64_t vector[C_MITM_VECTOR_WIDTH])
+{
+    uint64_t hash = 0;
+    unsigned coordinate;
+
+    for (coordinate = 0; coordinate < C_MITM_VECTOR_WIDTH; ++coordinate) {
+        hash += (uint64_t)vector[coordinate] *
+            mitm_hash_coefficient(coordinate);
+    }
+    return hash;
+}
+
+static void c_mitm_choice_vector(const struct search *search, unsigned row,
+                                 unsigned column, unsigned candidate,
+                                 int64_t vector[C_MITM_VECTOR_WIDTH])
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    unsigned actual_column = ordered_column(search, row, column);
+    unsigned coordinate;
+
+    for (coordinate = 0;
+         coordinate < C_MITM_PERMUTATION_COORDINATES; ++coordinate) {
+        vector[coordinate] = (int64_t)additive_perm_contribution_at(
+            search, bounds, row, candidate, actual_column, coordinate);
+    }
+    for (coordinate = 0; coordinate < DICE - 1U; ++coordinate) {
+        vector[C_MITM_PERMUTATION_COORDINATES + coordinate] =
+            (int64_t)choice_contribution(
+                search, row, candidate, column, coordinate);
+    }
+}
+
+static void reset_c_mitm_workspace(struct c_mitm_workspace *workspace)
+{
+    /*
+     * The filter's low half is the validity tag for head[].  Clearing its
+     * compact, contiguous four MiB is much cheaper than revisiting millions of
+     * entries and randomly clearing the 64 MiB head table.  A head value
+     * whose bit is clear belongs to an earlier solve and is never read.
+     */
+    memset(workspace->filter, 0,
+           (((size_t)workspace->head_capacity +
+              C_MITM_FILTER_BUCKETS_PER_WORD - 1U) /
+             C_MITM_FILTER_BUCKETS_PER_WORD) *
+               sizeof(*workspace->filter));
+}
+
+static inline uint64_t c_mitm_filter_mask(uint64_t hash, uint32_t bucket)
+{
+    uint64_t occupied = UINT64_C(1) <<
+        (bucket & (C_MITM_FILTER_BUCKETS_PER_WORD - 1U));
+    uint64_t fingerprint = UINT64_C(1) <<
+        (C_MITM_FILTER_FINGERPRINT_SHIFT +
+         ((unsigned)(hash >> 32U) &
+          (C_MITM_FILTER_BUCKETS_PER_WORD - 1U)));
+
+    return occupied | fingerprint;
+}
+
+static inline void c_mitm_advance_ternary(
+    unsigned digit[SEARCH_COLUMNS], unsigned variable_offset,
+    uint64_t delta_hash[SEARCH_COLUMNS][3], uint64_t *current_hash,
+    uint32_t *packed)
+{
+    unsigned local = 0;
+
+    for (;;) {
+        unsigned variable = variable_offset + local;
+        unsigned old = digit[local];
+        unsigned next = old + 1U;
+
+        *current_hash -= delta_hash[variable][old];
+        if (next == 3U) {
+            next = 0;
+        }
+        digit[local] = next;
+        *current_hash += delta_hash[variable][next];
+        *packed &= ~(UINT32_C(3) << (2U * local));
+        *packed |= (uint32_t)next << (2U * local);
+        if (next != 0U) {
+            return;
+        }
+        ++local;
+    }
+}
+
+static inline void c_mitm_store_entry(struct c_mitm_entry *entry,
+                                      uint64_t hash, uint32_t choices,
+                                      uint32_t next)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __m128i value = _mm_set_epi32(
+        (int)next, (int)choices, (int)(hash >> 32U), (int)hash);
+
+    _mm_stream_si128((__m128i *)(void *)entry, value);
+#else
+    entry->hash = hash;
+    entry->choices = choices;
+    entry->next = next;
+#endif
+}
+
+static inline void c_mitm_finish_entry_writes(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    _mm_sfence();
+#endif
+}
+
+/*
+ * Once A and B are fixed, every C choice contributes independently to five
+ * ABC permutation differences and four full-set place tallies.  Join the
+ * ternary column choices exactly in those nine coordinates.  The 64-bit
+ * fingerprint is only an index; every hit is reconstructed and checked in
+ * every exact coordinate before the C row is installed.
+ */
+static void solve_c_meet_in_middle(struct search *search, unsigned row)
+{
+    const struct additive_perm_bounds *bounds =
+        &search->additive_permutations;
+    struct c_mitm_workspace *workspace = search->c_mitm;
+    unsigned base_candidate[SEARCH_COLUMNS];
+    unsigned variable_position[SEARCH_COLUMNS];
+    unsigned option_candidate[SEARCH_COLUMNS][3];
+    int64_t delta[SEARCH_COLUMNS][3][C_MITM_VECTOR_WIDTH];
+    uint64_t delta_hash[SEARCH_COLUMNS][3];
+    int64_t base[C_MITM_VECTOR_WIDTH] = {0};
+    int64_t target[C_MITM_VECTOR_WIDTH];
+    int64_t target_delta[C_MITM_VECTOR_WIDTH];
+    unsigned variable_count = 0;
+    unsigned left_variables;
+    uint32_t left_count = 1;
+    uint32_t right_count = 1;
+    uint64_t target_hash;
+    unsigned column;
+    unsigned coordinate;
+
+    ++search->c_mitm_solves;
+    reset_c_mitm_workspace(workspace);
+
+    if (bounds->permutation_count[row] !=
+            C_MITM_PERMUTATION_COORDINATES + 1U) {
+        goto internal_error;
+    }
+    for (coordinate = 0;
+         coordinate < C_MITM_PERMUTATION_COORDINATES; ++coordinate) {
+        target[coordinate] = (int64_t)bounds->goal[row];
+    }
+    for (; coordinate < C_MITM_VECTOR_WIDTH; ++coordinate) {
+        target[coordinate] = (int64_t)search->place_goal;
+    }
+
+    for (column = 0; column < SEARCH_COLUMNS; ++column) {
+        unsigned candidates = search->candidate_mask[row][column];
+        unsigned first;
+        int64_t first_vector[C_MITM_VECTOR_WIDTH];
+
+        if (candidates == 0U) {
+            return;
+        }
+        first = (unsigned)__builtin_ctz(candidates);
+        candidates &= candidates - 1U;
+        base_candidate[column] = first;
+        c_mitm_choice_vector(
+            search, row, column, first, first_vector);
+        for (coordinate = 0; coordinate < C_MITM_VECTOR_WIDTH;
+             ++coordinate) {
+            base[coordinate] += first_vector[coordinate];
+        }
+        if (candidates != 0U) {
+            unsigned count = 1U;
+
+            variable_position[variable_count] = column;
+            option_candidate[variable_count][0] = first;
+            memset(delta[variable_count][0], 0,
+                   sizeof(delta[variable_count][0]));
+            delta_hash[variable_count][0] = 0;
+            while (candidates != 0U && count < 3U) {
+                unsigned candidate = (unsigned)__builtin_ctz(candidates);
+                int64_t vector[C_MITM_VECTOR_WIDTH];
+
+                candidates &= candidates - 1U;
+                option_candidate[variable_count][count] = candidate;
+                c_mitm_choice_vector(
+                    search, row, column, candidate, vector);
+                for (coordinate = 0; coordinate < C_MITM_VECTOR_WIDTH;
+                     ++coordinate) {
+                    delta[variable_count][count][coordinate] =
+                        vector[coordinate] - first_vector[coordinate];
+                }
+                delta_hash[variable_count][count] =
+                    c_mitm_vector_hash(delta[variable_count][count]);
+                ++count;
+            }
+            if (candidates != 0U) {
+                goto internal_error;
+            }
+            if (count != 3U) {
+                goto internal_error;
+            }
+            ++variable_count;
+        }
+    }
+
+    if (variable_count != SEARCH_COLUMNS - 1U) {
+        goto internal_error;
+    }
+    left_variables = variable_count / 2U;
+    for (column = 0; column < left_variables; ++column) {
+        if (left_count > UINT32_MAX / 3U) {
+            goto internal_error;
+        }
+        left_count *= 3U;
+    }
+    for (column = left_variables; column < variable_count; ++column) {
+        if (right_count > UINT32_MAX / 3U) {
+            goto internal_error;
+        }
+        right_count *= 3U;
+    }
+    if (left_count > workspace->entry_capacity ||
+        left_count * 2U > workspace->head_capacity) {
+        goto internal_error;
+    }
+
+    {
+        unsigned digit[SEARCH_COLUMNS] = {0};
+        uint32_t packed = 0;
+        uint64_t current_hash = 0;
+        uint32_t ordinal = 0;
+
+        while (ordinal < left_count) {
+            uint64_t hash[C_MITM_PREFETCH_BATCH];
+            uint32_t choices[C_MITM_PREFETCH_BATCH];
+            unsigned count = left_count - ordinal;
+            unsigned index;
+
+            if (count > C_MITM_PREFETCH_BATCH) {
+                count = C_MITM_PREFETCH_BATCH;
+            }
+            for (index = 0; index < count; ++index) {
+                uint32_t bucket;
+
+                hash[index] = current_hash;
+                choices[index] = packed;
+                bucket = (uint32_t)current_hash &
+                    (workspace->head_capacity - 1U);
+                __builtin_prefetch(
+                    &workspace->filter[
+                        bucket / C_MITM_FILTER_BUCKETS_PER_WORD], 1, 1);
+                __builtin_prefetch(&workspace->head[bucket], 1, 0);
+                if (ordinal + index + 1U < left_count) {
+                    c_mitm_advance_ternary(
+                        digit, 0, delta_hash, &current_hash, &packed);
+                }
+            }
+            for (index = 0; index < count; ++index) {
+                uint32_t entry_ordinal = ordinal + index;
+                uint32_t bucket = (uint32_t)hash[index] &
+                    (workspace->head_capacity - 1U);
+                uint64_t filter_mask =
+                    c_mitm_filter_mask(hash[index], bucket);
+                uint64_t *filter_word = &workspace->filter[
+                    bucket / C_MITM_FILTER_BUCKETS_PER_WORD];
+                struct c_mitm_entry *entry =
+                    &workspace->entry[entry_ordinal];
+                uint32_t next = (*filter_word &
+                                 (UINT64_C(1) <<
+                                  (bucket &
+                                   (C_MITM_FILTER_BUCKETS_PER_WORD - 1U)))) !=
+                        0U
+                    ? workspace->head[bucket] : UINT32_MAX;
+
+                c_mitm_store_entry(
+                    entry, hash[index], choices[index], next);
+                workspace->head[bucket] = entry_ordinal;
+                *filter_word |= filter_mask;
+            }
+            ordinal += count;
+            if ((ordinal & PROGRESS_CHECK_MASK) == 0U &&
+                atomic_load_explicit(
+                    &search->shared->stop, memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+    c_mitm_finish_entry_writes();
+
+    for (coordinate = 0; coordinate < C_MITM_VECTOR_WIDTH; ++coordinate) {
+        target_delta[coordinate] = target[coordinate] - base[coordinate];
+    }
+    target_hash = c_mitm_vector_hash(target_delta);
+    {
+        unsigned digit[SEARCH_COLUMNS] = {0};
+        uint32_t packed = 0;
+        uint64_t current_hash = 0;
+        uint32_t ordinal = 0;
+
+        while (ordinal < right_count) {
+            uint64_t needed_hash[C_MITM_PREFETCH_BATCH];
+            uint32_t choices[C_MITM_PREFETCH_BATCH];
+            uint32_t bucket[C_MITM_PREFETCH_BATCH];
+            uint32_t survivor[C_MITM_PREFETCH_BATCH];
+            uint32_t survivor_entry[C_MITM_PREFETCH_BATCH];
+            unsigned count = right_count - ordinal;
+            unsigned survivor_count = 0;
+            unsigned index;
+
+            if (count > C_MITM_PREFETCH_BATCH) {
+                count = C_MITM_PREFETCH_BATCH;
+            }
+            for (index = 0; index < count; ++index) {
+                needed_hash[index] = target_hash - current_hash;
+                choices[index] = packed;
+                bucket[index] = (uint32_t)needed_hash[index] &
+                    (workspace->head_capacity - 1U);
+                __builtin_prefetch(
+                    &workspace->filter[
+                        bucket[index] /
+                            C_MITM_FILTER_BUCKETS_PER_WORD], 0, 1);
+                if (ordinal + index + 1U < right_count) {
+                    c_mitm_advance_ternary(
+                        digit, left_variables, delta_hash,
+                        &current_hash, &packed);
+                }
+            }
+            for (index = 0; index < count; ++index) {
+                uint64_t filter_mask =
+                    c_mitm_filter_mask(needed_hash[index], bucket[index]);
+                uint64_t filter_word = workspace->filter[
+                    bucket[index] / C_MITM_FILTER_BUCKETS_PER_WORD];
+
+                if ((filter_word & filter_mask) == filter_mask) {
+                    survivor[survivor_count++] = index;
+                    __builtin_prefetch(
+                        &workspace->head[bucket[index]], 0, 0);
+                }
+            }
+            for (index = 0; index < survivor_count; ++index) {
+                unsigned query = survivor[index];
+
+                survivor_entry[index] = workspace->head[bucket[query]];
+                __builtin_prefetch(
+                    &workspace->entry[survivor_entry[index]], 0, 0);
+            }
+            for (index = 0; index < survivor_count; ++index) {
+                unsigned query = survivor[index];
+                uint32_t entry_index = survivor_entry[index];
+                uint32_t right_choices = choices[query];
+
+                while (entry_index != UINT32_MAX) {
+                    const struct c_mitm_entry *entry =
+                        &workspace->entry[entry_index];
+
+                    if (entry->hash == needed_hash[query]) {
+                        int64_t total[C_MITM_VECTOR_WIDTH];
+                        unsigned variable;
+                        bool exact = true;
+
+                        memcpy(total, base, sizeof(total));
+                        for (variable = 0; variable < left_variables;
+                             ++variable) {
+                            unsigned choice = (entry->choices >>
+                                (2U * variable)) & 3U;
+
+                            for (coordinate = 0;
+                                 coordinate < C_MITM_VECTOR_WIDTH;
+                                 ++coordinate) {
+                                total[coordinate] +=
+                                    delta[variable][choice][coordinate];
+                            }
+                        }
+                        for (variable = 0;
+                             variable + left_variables < variable_count;
+                             ++variable) {
+                            unsigned choice = (right_choices >>
+                                (2U * variable)) & 3U;
+                            unsigned delta_index =
+                                left_variables + variable;
+
+                            for (coordinate = 0;
+                                 coordinate < C_MITM_VECTOR_WIDTH;
+                                 ++coordinate) {
+                                total[coordinate] +=
+                                    delta[delta_index][choice][coordinate];
+                            }
+                        }
+                        for (coordinate = 0;
+                             coordinate < C_MITM_VECTOR_WIDTH;
+                             ++coordinate) {
+                            if (total[coordinate] != target[coordinate]) {
+                                exact = false;
+                                break;
+                            }
+                        }
+                        if (exact) {
+                            unsigned selected[SEARCH_COLUMNS];
+
+                            memcpy(
+                                selected, base_candidate, sizeof(selected));
+                            for (variable = 0;
+                                 variable < left_variables; ++variable) {
+                                unsigned choice = (entry->choices >>
+                                    (2U * variable)) & 3U;
+                                unsigned position =
+                                    variable_position[variable];
+
+                                selected[position] =
+                                    option_candidate[variable][choice];
+                            }
+                            for (variable = 0;
+                                 variable + left_variables < variable_count;
+                                 ++variable) {
+                                unsigned choice = (right_choices >>
+                                    (2U * variable)) & 3U;
+                                unsigned option_index =
+                                    left_variables + variable;
+                                unsigned position =
+                                    variable_position[option_index];
+
+                                selected[position] =
+                                    option_candidate[option_index][choice];
+                            }
+                            for (column = 0; column < SEARCH_COLUMNS;
+                                 ++column) {
+                                apply_choice(
+                                    search, row, column, selected[column]);
+                            }
+                            exact = completed_row_is_fair(search, row);
+                            for (coordinate = 0;
+                                 exact && coordinate <
+                                     bounds->permutation_count[row];
+                                 ++coordinate) {
+                                exact = bounds->tally[row][coordinate] ==
+                                    bounds->goal[row];
+                            }
+                            if (!exact) {
+                                column = SEARCH_COLUMNS;
+                                while (column-- > 0) {
+                                    undo_choice(
+                                        search, row, column,
+                                        selected[column]);
+                                }
+                                goto internal_error;
+                            }
+                            ++search->c_mitm_matches;
+                            ++search->completed_rows[row];
+                            search_row(search, row + 1U, 0);
+                            column = SEARCH_COLUMNS;
+                            while (column-- > 0) {
+                                undo_choice(
+                                    search, row, column, selected[column]);
+                            }
+                            if (atomic_load_explicit(
+                                    &search->shared->stop,
+                                    memory_order_relaxed)) {
+                                return;
+                            }
+                        }
+                    }
+                    entry_index = entry->next;
+                }
+            }
+            ordinal += count;
+            if ((ordinal & PROGRESS_CHECK_MASK) == 0U &&
+                atomic_load_explicit(
+                    &search->shared->stop, memory_order_relaxed)) {
+                return;
+            }
+        }
+    }
+    return;
+
+internal_error:
+    atomic_store_explicit(&search->shared->internal_error, true,
+                          memory_order_relaxed);
+    atomic_store_explicit(&search->shared->stop, true,
+                          memory_order_relaxed);
 }
 #endif
 
@@ -5200,6 +5781,7 @@ static void solve_row1_meet_in_middle(struct search *search, unsigned row)
                                 search, row, column, selected[column]);
                         }
                         if (completed_row_is_fair(search, row)) {
+                            ++search->completed_rows[row];
                             search_row(search, row + 1U, 0);
                         }
                         column = SEARCH_COLUMNS;
@@ -5268,6 +5850,9 @@ static void search_row(struct search *search, unsigned row, unsigned column)
 #if ROW1_MITM_ACTIVE
              || row == 1U
 #endif
+#if C_MITM_ACTIVE
+             || row == 2U
+#endif
             ) && !search->template_active) {
             prepare_mitm_columns(search, row);
         } else
@@ -5287,6 +5872,13 @@ static void search_row(struct search *search, unsigned row, unsigned column)
 #if ROW1_MITM_ACTIVE
     if (row == 1U && column == 0 && !search->template_active) {
         solve_row1_meet_in_middle(search, row);
+        return;
+    }
+#endif
+#if C_MITM_ACTIVE
+    if (row == 2U && column == 0U && !search->template_active) {
+        build_additive_perm_bounds(search, row);
+        solve_c_meet_in_middle(search, row);
         return;
     }
 #endif
@@ -5383,6 +5975,7 @@ static void search_row(struct search *search, unsigned row, unsigned column)
             return;
         }
 #endif
+        ++search->completed_rows[row];
         if (row + 1U < DICE - 1U) {
             search_row(search, row + 1U, 0);
         } else {
@@ -5496,6 +6089,60 @@ static void prepare_template_search(struct search *search,
     }
 }
 
+#if C_MITM_ACTIVE
+static bool initialize_c_mitm_workspace(struct c_mitm_workspace *workspace)
+{
+    uint64_t capacity64;
+    uint32_t head_capacity = 1U;
+    unsigned left_variables = (SEARCH_COLUMNS - 1U) / 2U;
+
+    memset(workspace, 0, sizeof(*workspace));
+    if (!integer_power(3U, left_variables, &capacity64) ||
+        capacity64 == 0U || capacity64 > UINT32_MAX) {
+        return false;
+    }
+    while ((uint64_t)head_capacity < 2U * capacity64) {
+        if (head_capacity > UINT32_MAX / 2U) {
+            return false;
+        }
+        head_capacity *= 2U;
+    }
+    workspace->entry_capacity = (uint32_t)capacity64;
+    workspace->head_capacity = head_capacity;
+    if (posix_memalign(
+            (void **)&workspace->entry, 64U,
+            (size_t)workspace->entry_capacity *
+                sizeof(*workspace->entry)) != 0) {
+        workspace->entry = NULL;
+    }
+    workspace->head = malloc(
+        (size_t)workspace->head_capacity * sizeof(*workspace->head));
+    workspace->filter = malloc(
+        (((size_t)workspace->head_capacity +
+           C_MITM_FILTER_BUCKETS_PER_WORD - 1U) /
+          C_MITM_FILTER_BUCKETS_PER_WORD) *
+            sizeof(*workspace->filter));
+    if (workspace->entry == NULL || workspace->head == NULL ||
+        workspace->filter == NULL) {
+        free(workspace->filter);
+        free(workspace->head);
+        free(workspace->entry);
+        memset(workspace, 0, sizeof(*workspace));
+        return false;
+    }
+    reset_c_mitm_workspace(workspace);
+    return true;
+}
+
+static void destroy_c_mitm_workspace(struct c_mitm_workspace *workspace)
+{
+    free(workspace->filter);
+    free(workspace->head);
+    free(workspace->entry);
+    memset(workspace, 0, sizeof(*workspace));
+}
+#endif
+
 static bool initialize_search(struct search *search,
                               const struct options *options,
                               unsigned *start_row)
@@ -5541,8 +6188,13 @@ static bool initialize_search(struct search *search,
 
 struct totals {
     uint64_t nodes;
+    uint64_t completed_rows[DICE];
 #if ROW2_MITM_ACTIVE
     uint64_t mitm_solves;
+#endif
+#if C_MITM_ACTIVE
+    uint64_t c_mitm_solves;
+    uint64_t c_mitm_matches;
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     uint64_t completion_checks;
@@ -5577,6 +6229,8 @@ struct totals {
 };
 
 #define SI_COUNT_TEXT_SIZE 24
+#define ROW_PROGRESS_TEXT_SIZE \
+    (DICE * (SI_COUNT_TEXT_SIZE + 3U) + 1U)
 
 /* Keep exact small counts, then use four significant digits and an SI suffix. */
 static void format_si_count(char text[SI_COUNT_TEXT_SIZE], uint64_t value)
@@ -5634,6 +6288,31 @@ static void format_si_count(char text[SI_COUNT_TEXT_SIZE], uint64_t value)
     }
 }
 
+static void format_row_progress(
+    char text[ROW_PROGRESS_TEXT_SIZE],
+    const uint64_t completed_rows[DICE],
+    const unsigned logical_die[DICE])
+{
+    size_t used = 0;
+    unsigned row;
+
+    for (row = 0; row < DICE; ++row) {
+        char count[SI_COUNT_TEXT_SIZE];
+        int written;
+
+        format_si_count(count, completed_rows[row]);
+        written = snprintf(text + used, ROW_PROGRESS_TEXT_SIZE - used,
+                           "%s%c:%s", row == 0U ? "" : ",",
+                           'A' + logical_die[row], count);
+        if (written < 0 || (size_t)written >=
+                ROW_PROGRESS_TEXT_SIZE - used) {
+            text[ROW_PROGRESS_TEXT_SIZE - 1U] = '\0';
+            return;
+        }
+        used += (size_t)written;
+    }
+}
+
 static struct totals collect_totals(const struct worker *workers,
                                     unsigned thread_count)
 {
@@ -5641,11 +6320,24 @@ static struct totals collect_totals(const struct worker *workers,
     unsigned i;
 
     for (i = 0; i < thread_count; ++i) {
+        unsigned row;
+
         totals.nodes += atomic_load_explicit(&workers[i].stats.nodes,
                                              memory_order_relaxed);
+        for (row = 0; row < DICE; ++row) {
+            totals.completed_rows[row] += atomic_load_explicit(
+                &workers[i].stats.completed_rows[row],
+                memory_order_relaxed);
+        }
 #if ROW2_MITM_ACTIVE
         totals.mitm_solves += atomic_load_explicit(
             &workers[i].stats.mitm_solves, memory_order_relaxed);
+#endif
+#if C_MITM_ACTIVE
+        totals.c_mitm_solves += atomic_load_explicit(
+            &workers[i].stats.c_mitm_solves, memory_order_relaxed);
+        totals.c_mitm_matches += atomic_load_explicit(
+            &workers[i].stats.c_mitm_matches, memory_order_relaxed);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
         totals.completion_checks += atomic_load_explicit(
@@ -5934,8 +6626,13 @@ static void print_progress(const struct shared_state *shared,
         ? permutation_total
         : shared->mirror_symmetric_total;
     char nodes[SI_COUNT_TEXT_SIZE];
+    char row_progress[ROW_PROGRESS_TEXT_SIZE];
 #if ROW2_MITM_ACTIVE
     char mitm_solves[SI_COUNT_TEXT_SIZE];
+#endif
+#if C_MITM_ACTIVE
+    char c_mitm_solves[SI_COUNT_TEXT_SIZE];
+    char c_mitm_matches[SI_COUNT_TEXT_SIZE];
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     char completion_checks[SI_COUNT_TEXT_SIZE];
@@ -5973,8 +6670,14 @@ static void print_progress(const struct shared_state *shared,
 #endif
 
     format_si_count(nodes, totals.nodes);
+    format_row_progress(row_progress, totals.completed_rows,
+                        workers[0].search.logical_die);
 #if ROW2_MITM_ACTIVE
     format_si_count(mitm_solves, totals.mitm_solves);
+#endif
+#if C_MITM_ACTIVE
+    format_si_count(c_mitm_solves, totals.c_mitm_solves);
+    format_si_count(c_mitm_matches, totals.c_mitm_matches);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
     format_si_count(completion_checks, totals.completion_checks);
@@ -6017,6 +6720,7 @@ static void print_progress(const struct shared_state *shared,
     fprintf(stderr,
             "progress: %.1fs workers=%u jobs=%" PRIu64 "/%" PRIu64
             " nodes=%s"
+            " rows=%s"
             " place-pruned=%s"
             " linear-place-pruned=%s"
 #if !ROW1_MITM_ACTIVE
@@ -6037,6 +6741,11 @@ static void print_progress(const struct shared_state *shared,
             " early-completion-checks=%s early-completion-pruned=%s"
             " early-completion-states=%s"
 #endif
+#endif
+#if C_MITM_ACTIVE
+            " c-mitm-solves=%s c-mitm-matches=%s"
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if INCREMENTAL_C_COMPLETION_ACTIVE
             " c-completion-checks=%s c-completion-pruned=%s"
 #if INCREMENTAL_C_COMPLETION_COUPLED
@@ -6051,7 +6760,7 @@ static void print_progress(const struct shared_state *shared,
 #endif
             " permutation-fair=%s mirror-symmetric=%s\n",
             monotonic_seconds() - start_time, workers_running, jobs_done,
-            shared->job_count, nodes,
+            shared->job_count, nodes, row_progress,
             bound_prunes,
             linear_place_prunes,
 #if !ROW1_MITM_ACTIVE
@@ -6072,6 +6781,11 @@ static void print_progress(const struct shared_state *shared,
             early_completion_checks, early_completion_prunes,
             early_completion_states,
 #endif
+#endif
+#if C_MITM_ACTIVE
+            c_mitm_solves, c_mitm_matches,
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if INCREMENTAL_C_COMPLETION_ACTIVE
             c_completion_checks, c_completion_prunes,
 #if INCREMENTAL_C_COMPLETION_COUPLED
@@ -6340,9 +7054,32 @@ int main(int argc, char **argv)
         workers[i].shared = &shared;
         workers[i].search.shared = &shared;
         workers[i].search.published = &workers[i].stats;
+#if C_MITM_ACTIVE
+        if (!options.template_active) {
+            if (!initialize_c_mitm_workspace(&workers[i].c_mitm)) {
+                fprintf(stderr,
+                        "Unable to allocate C-row MITM workspace for worker %u.\n",
+                        i);
+                exit_status = EXIT_FAILURE;
+                goto cleanup;
+            }
+            workers[i].search.c_mitm = &workers[i].c_mitm;
+        }
+#endif
         atomic_init(&workers[i].stats.nodes, 0);
+        {
+            unsigned row;
+
+            for (row = 0; row < DICE; ++row) {
+                atomic_init(&workers[i].stats.completed_rows[row], 0);
+            }
+        }
 #if ROW2_MITM_ACTIVE
         atomic_init(&workers[i].stats.mitm_solves, 0);
+#endif
+#if C_MITM_ACTIVE
+        atomic_init(&workers[i].stats.c_mitm_solves, 0);
+        atomic_init(&workers[i].stats.c_mitm_matches, 0);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
         atomic_init(&workers[i].stats.completion_checks, 0);
@@ -6401,6 +7138,34 @@ int main(int argc, char **argv)
 #if INCREMENTAL_C_COMPLETION_COUPLED
     fputs("+X+Y/X-Y", stderr);
 #endif
+#endif
+#if C_MITM_ACTIVE
+    if (!options.template_active) {
+        unsigned left_variables = (SEARCH_COLUMNS - 1U) / 2U;
+        unsigned right_variables =
+            SEARCH_COLUMNS - 1U - left_variables;
+        uint64_t right_states = 0;
+        size_t workspace_bytes =
+            (size_t)workers[0].c_mitm.entry_capacity *
+                sizeof(*workers[0].c_mitm.entry) +
+            (size_t)workers[0].c_mitm.head_capacity *
+                sizeof(*workers[0].c_mitm.head) +
+            (((size_t)workers[0].c_mitm.head_capacity +
+               C_MITM_FILTER_BUCKETS_PER_WORD - 1U) /
+             C_MITM_FILTER_BUCKETS_PER_WORD) *
+                sizeof(*workers[0].c_mitm.filter);
+        size_t workspace_tenths =
+            (workspace_bytes * 10U + (1U << 19)) >> 20U;
+
+        if (!integer_power(3U, right_variables, &right_states)) {
+            right_states = UINT64_MAX;
+        }
+        fprintf(stderr,
+                ", c-mitm-states=%" PRIu32 "+%" PRIu64
+                ", c-mitm-workspace=%zu.%zuMiB/worker",
+                workers[0].c_mitm.entry_capacity, right_states,
+                workspace_tenths / 10U, workspace_tenths % 10U);
+    }
 #endif
     if (options.random_order) {
         fprintf(stderr, ", seed=%" PRIu64, options.seed);
@@ -6494,8 +7259,13 @@ int main(int argc, char **argv)
                 !hit_limit && !sigint_requested;
             bool search_failed;
             char nodes[SI_COUNT_TEXT_SIZE];
+            char row_progress[ROW_PROGRESS_TEXT_SIZE];
 #if ROW2_MITM_ACTIVE
             char mitm_solves[SI_COUNT_TEXT_SIZE];
+#endif
+#if C_MITM_ACTIVE
+            char c_mitm_solves[SI_COUNT_TEXT_SIZE];
+            char c_mitm_matches[SI_COUNT_TEXT_SIZE];
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             char completion_checks[SI_COUNT_TEXT_SIZE];
@@ -6534,8 +7304,14 @@ int main(int argc, char **argv)
 #endif
 
             format_si_count(nodes, totals.nodes);
+            format_row_progress(row_progress, totals.completed_rows,
+                                workers[0].search.logical_die);
 #if ROW2_MITM_ACTIVE
             format_si_count(mitm_solves, totals.mitm_solves);
+#endif
+#if C_MITM_ACTIVE
+            format_si_count(c_mitm_solves, totals.c_mitm_solves);
+            format_si_count(c_mitm_matches, totals.c_mitm_matches);
 #endif
 #if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
             format_si_count(completion_checks, totals.completion_checks);
@@ -6642,6 +7418,7 @@ int main(int argc, char **argv)
             fprintf(stderr,
                     "Search %s: %.2fs, %u workers, jobs=%" PRIu64 "/%" PRIu64
                     ", nodes=%s (%s/s)"
+                    ", rows=%s"
                     ", place-pruned=%s"
                     ", linear-place-prunes=%s"
 #if !ROW1_MITM_ACTIVE
@@ -6663,6 +7440,11 @@ int main(int argc, char **argv)
                     ", early-completion-pruned=%s"
                     ", early-completion-states=%s"
 #endif
+#endif
+#if C_MITM_ACTIVE
+                    ", c-mitm-solves=%s, c-mitm-matches=%s"
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if INCREMENTAL_C_COMPLETION_ACTIVE
                     ", c-completion-checks=%s"
                     ", c-completion-pruned=%s"
@@ -6683,7 +7465,7 @@ int main(int argc, char **argv)
                     elapsed,
                     shared.thread_count,
                     jobs_done,
-                    shared.job_count, nodes, node_rate,
+                    shared.job_count, nodes, node_rate, row_progress,
                     bound_prunes, linear_place_prunes,
 #if !ROW1_MITM_ACTIVE
                     pair_bound_prunes,
@@ -6703,6 +7485,11 @@ int main(int argc, char **argv)
                     early_completion_checks, early_completion_prunes,
                     early_completion_states,
 #endif
+#endif
+#if C_MITM_ACTIVE
+                    c_mitm_solves, c_mitm_matches,
+#endif
+#if CONDITIONED_COMPLETION_BOUNDS_ACTIVE
 #if INCREMENTAL_C_COMPLETION_ACTIVE
                     c_completion_checks, c_completion_prunes,
 #if INCREMENTAL_C_COMPLETION_COUPLED
@@ -6732,6 +7519,13 @@ int main(int argc, char **argv)
 cleanup:
     drain_solutions(&shared);
     free(prototype);
+#if C_MITM_ACTIVE
+    if (workers != NULL) {
+        for (i = 0; i < shared.thread_count; ++i) {
+            destroy_c_mitm_workspace(&workers[i].c_mitm);
+        }
+    }
+#endif
     free(workers);
     free(shared.job_order);
     free(shared.solution_write_buffer);

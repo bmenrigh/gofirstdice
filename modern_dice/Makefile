@@ -20,6 +20,8 @@ ROW1_MITM ?= $(if $(filter 4,$(DICE)),$(ROW_MITM),0)
 COMPLETION_BOUNDS ?= $(if $(filter 5,$(DICE)),$(ROW_MITM),0)
 EARLY_COMPLETION ?= 1
 C_COMPLETION ?= 0
+# Replace recursive C construction with an exact ternary half-row join.
+C_MITM ?= 0
 # Direction one is scalar and cheap; directions three through six introduce
 # successively more expensive sparse nonlinear frontiers.
 C_COMPLETION_DIRECTIONS ?= 1
@@ -42,6 +44,7 @@ CPPFLAGS += -DDICE=$(DICE) -DSIDES=$(SIDES) -DMIRROR=$(MIRROR) \
 	-DCONDITIONED_COMPLETION_BOUNDS=$(COMPLETION_BOUNDS) \
 	-DEARLY_CONDITIONED_COMPLETION_BOUNDS=$(EARLY_COMPLETION) \
 	-DINCREMENTAL_C_COMPLETION=$(C_COMPLETION) \
+	-DC_MITM=$(C_MITM) \
 	-DINCREMENTAL_C_COMPLETION_DIRECTIONS=$(C_COMPLETION_DIRECTIONS) \
 	-DINCREMENTAL_C_COMPLETION_COUPLED=$(C_COMPLETION_COUPLED) \
 	-DLINEAR_BOUND_STRIDE=$(LINEAR_STRIDE) \
@@ -85,7 +88,7 @@ define build_with_pgo
 	trap 'exit 130' HUP INT TERM; \
 	echo "Building instrumented $(1)" \
 		"(DICE=$(DICE), SIDES=$(SIDES), PERM_ONLY=$(PERM_ONLY)," \
-		"ROW_MITM=$(ROW_MITM), C_COMPLETION=$(C_COMPLETION)/$(C_COMPLETION_DIRECTIONS)+coupled$(C_COMPLETION_COUPLED)," \
+		"ROW_MITM=$(ROW_MITM), C_MITM=$(C_MITM), C_COMPLETION=$(C_COMPLETION)/$(C_COMPLETION_DIRECTIONS)+coupled$(C_COMPLETION_COUPLED)," \
 		"MIRROR_COLUMNS=$(if $(strip $(MIRROR_COLUMNS)),$(MIRROR_COLUMNS),legacy))"; \
 	$(PGO_CC) $(CPPFLAGS) $(3) $(CFLAGS) \
 		-fprofile-generate="$$pgo_dir" -fprofile-update=atomic \
